@@ -1,0 +1,1379 @@
+# v1.9.9 – 2025-11-17 23:45
+
+__Name__ = 'CLOCK'
+__Comment__ = 'Clock,Timer, Alarm ,Countdown,Pomodoro, Exam mode'
+__Author__ = 'AI Assistant + Imagineer'
+__Version__ = '1.0.0'
+__Date__ = '2025-11-08'
+__License__ = 'MIT'
+__Web__ = 'www.youtube.com/@imagine7547'
+__Wiki__ = 'https://github.com/wpegley/CLOCK'
+__Icon__ = ''
+__Help__ = ''
+__Status__ = 'Stable'
+__Requires__ = 'FreeCAD >= v1.1'
+
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtGui, QtCore
+import datetime
+import time
+import os
+import sys
+import shutil
+import tempfile
+import platform
+import subprocess
+import glob
+
+# --- Try to import openpyxl for XLSX export ---
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font, Alignment
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    print("Warning: openpyxl not found. XLSX export disabled.")
+
+# --- Global Time Zones (expanded) ---
+GLOBAL_ZONES = {
+    # Oceania
+    "Sydney, AU (AEST/AEDT)": 10,   # +11 during DST
+    "Melbourne, AU (AEST/AEDT)": 10,
+    "Brisbane, AU (AEST)": 10,
+    "Perth, AU (AWST)": 8,
+    "Auckland, NZ (NZST/NZDT)": 12,
+
+    # Asia
+    "Tokyo, Japan (JST)": 9,
+    "Seoul, Korea (KST)": 9,
+    "Shanghai, China (CST)": 8,
+    "Singapore (SGT)": 8,
+    "Hong Kong (HKT)": 8,
+    "Bangkok, Thailand (ICT)": 7,
+    "New Delhi, India (IST)": 5.5,
+    "Dubai, UAE (GST)": 4,
+
+    # Europe
+    "London, UK (GMT/BST)": 0,
+    "Paris, France (CET/CEST)": 1,
+    "Berlin, Germany (CET/CEST)": 1,
+    "Madrid, Spain (CET/CEST)": 1,
+    "Rome, Italy (CET/CEST)": 1,
+    "Moscow, Russia (MSK)": 3,
+
+    # Africa
+    "Cape Town, South Africa (SAST)": 2,
+    "Nairobi, Kenya (EAT)": 3,
+
+    # Americas
+    "New York, USA (EST/EDT)": -5,
+    "Chicago, USA (CST/CDT)": -6,
+    "Denver, USA (MST/MDT)": -7,
+    "Los Angeles, USA (PST/PDT)": -8,
+    "Toronto, Canada (EST/EDT)": -5,
+    "São Paulo, Brazil (BRT)": -3,
+
+    # Odd offsets
+    "Kathmandu, Nepal (NPT)": 5.75,
+    "Yangon, Myanmar (MMT)": 6.5,
+    "Tehran, Iran (IRST)": 3.5,
+}
+
+
+class ProjectTimeTrackerPanel:
+    """Main panel class for the FreeCAD Clock & Time Tracker dock."""
+    
+    def get_form(self):
+        return self.form
+
+    def create_title_label(self, text):
+        label = QtGui.QLabel(text)
+        font = QtGui.QFont()
+        font.setBold(True)
+        font.setPointSize(10)
+        label.setFont(font)
+        return label
+
+    def get_open_documents(self):
+        try:
+            docs = list(App.listDocuments().keys())
+            return docs if docs else ["No Document"]
+        except Exception:
+            return ["No Document"]
+
+    def get_default_xlsx_path(self):
+        current_path = os.path.abspath(__file__)
+        root_dir = current_path
+        max_levels = 10
+        levels = 0
+        while os.path.basename(root_dir) != 'Macro_Directory' and levels < max_levels:
+            parent = os.path.dirname(root_dir)
+            if parent == root_dir:
+                break
+            root_dir = parent
+            levels += 1
+        if os.path.basename(root_dir) == 'Macro_Directory':
+            data_folder = os.path.join(root_dir, 'Macro_03', 'Technical_Data')
+            os.makedirs(data_folder, exist_ok=True)
+            path = os.path.join(data_folder, "Project_Time_Data.xlsx")
+            print(f"Using relative path: {path}")
+            return path
+        else:
+            fallback = os.path.join(App.getUserAppDataDir(), "Project_Time_Data.xlsx")
+            print(f"Macro_Directory not found. Using fallback: {fallback}")
+            return fallback
+
+    def load_existing_data(self):
+        if not OPENPYXL_AVAILABLE:
+            return
+        path = self.default_xlsx_path
+        if not os.path.exists(path):
+            return
+        try:
+            wb = load_workbook(path)
+            if 'Alarm' not in wb.sheetnames:
+                wb.create_sheet('Alarm')
+                wb.save(path)
+            sheet_name = "Time_Log"
+            if sheet_name not in wb.sheetnames:
+                return
+            ws = wb[sheet_name]
+            self.project_times = {}
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row[0] and row[1] and row[2]:
+                    proj = str(row[0])
+                    dur = str(row[1])
+                    ts = str(row[2])
+                    self.project_times.setdefault(proj, []).append((dur, ts))
+            print(f"Loaded {sum(len(v) for v in self.project_times.values())} entries")
+        except Exception as e:
+            print(f"Load error: {e}")
+
+    def auto_save_to_xlsx(self):
+        if not OPENPYXL_AVAILABLE:
+            return
+        path = self.default_xlsx_path
+        try:
+            if os.path.exists(path):
+                shutil.copy2(path, path + ".bak")
+            temp_dir = os.path.dirname(path)
+            fd, temp_path = tempfile.mkstemp(suffix=".xlsx", dir=temp_dir)
+            os.close(fd)
+
+            wb = load_workbook(path) if os.path.exists(path) else Workbook()
+            sheet_name = "Time_Log"
+            if sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                ws.delete_rows(2, ws.max_row)
+            else:
+                ws = wb.create_sheet(sheet_name)
+                if 'Sheet' in wb.sheetnames and wb['Sheet'].max_row == 1:
+                    del wb['Sheet']
+
+            header = ["Project Name", "Duration (HH:MM:SS)", "Date & Time Logged"]
+            for col, txt in enumerate(header, 1):
+                ws.cell(1, col, txt)
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center')
+
+            row = 2
+            for proj, logs in self.project_times.items():
+                for dur, ts in logs:
+                    ws.cell(row, 1, proj)
+                    ws.cell(row, 2, dur)
+                    ws.cell(row, 3, ts)
+                    row += 1
+
+            for col in ws.columns:
+                max_len = 0
+                col_letter = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_len:
+                            max_len = len(str(cell.value))
+                    except:
+                        pass
+                ws.column_dimensions[col_letter].width = max_len + 2
+
+            wb.save(temp_path)
+            shutil.move(temp_path, path)
+            print(f"Auto-saved: {path}")
+        except Exception as e:
+            print(f"Save error: {e}")
+
+    def __init__(self):
+        self.default_xlsx_path = self.get_default_xlsx_path()
+        self.project_times = {"No Document": []}
+        self.load_existing_data()
+
+        self.form = QtGui.QWidget()
+        self.main_layout = QtGui.QVBoxLayout(self.form)
+        self.main_layout.setContentsMargins(3, 3, 3, 3)
+        self.main_layout.setSpacing(4)
+        self.main_layout.setAlignment(QtCore.Qt.AlignTop)
+
+        self.stopwatch_running = False
+        self.stopwatch_time = 0.0
+        self.stopwatch_start_time = 0.0
+
+        self.countdown_running = False
+        self.countdown_paused = False
+        self.countdown_total_seconds = 0
+        self.countdown_end_time = 0.0
+        self.countdown_paused_remaining = 0
+
+        self.pomodoro_running = False
+        self.pomodoro_paused = False
+        self.pomodoro_phase = 'focus'
+        self.pomodoro_end_time = 0.0
+        self.pomodoro_paused_remaining = 0
+
+        # Pomodoro sound playback control
+        self._pomodoro_sound_remaining = 0
+        self._pomodoro_current_sound_file = None
+        self._pomodoro_sound_session_id = 0
+
+        # Alarm: track last fire date to avoid multiple triggers per day
+        self._alarm_last_fired_date = None
+
+        # Exam clock
+        self.exam_zone_index = 0
+
+        self.cached_document_list = []
+
+        self.setup_checkbox_row()
+        self.setup_clock_section()
+        self.setup_timer_section()
+        self.setup_alarm_section()
+        self.setup_countdown_section()
+        self.setup_pomodoro_section()
+        self.setup_exam_section()
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_all)
+        self.timer.start(100)
+
+        self.form.destroyed.connect(self.cleanup)
+
+    def setup_checkbox_row(self):
+        row = QtGui.QHBoxLayout()
+        row.setSpacing(10)
+        switches = [
+            ("Clock", True),
+            ("Timer", True),
+            ("Alarm", True),
+            ("Countdown", False),
+            ("Pomodoro", False),
+            ("Exam", False),
+        ]
+        for name, checked in switches:
+            cb = QtGui.QCheckBox(name)
+            cb.setChecked(checked)
+            cb.setFont(QtGui.QFont(None, 10, QtGui.QFont.Bold))
+            row.addWidget(cb)
+            setattr(self, f"{name.lower()}_switch", cb)
+        row.addStretch()
+        self.main_layout.addLayout(row)
+
+    # -----------------------------------------------------------------------
+    # Clock Section
+    # -----------------------------------------------------------------------
+    def setup_clock_section(self):
+        self.clock_container = QtGui.QWidget()
+        lay = QtGui.QVBoxLayout(self.clock_container)
+        lay.setContentsMargins(1, 1, 1, 1)
+        lay.setSpacing(0)
+
+        self.clock_toggle_button = QtGui.QPushButton("Switch to Global Time")
+        self.clock_toggle_button.setStyleSheet("background-color:#55aaff;color:white;padding:2px;")
+        self.clock_toggle_button.clicked.connect(self.toggle_clock_view)
+        lay.addWidget(self.clock_toggle_button)
+
+        self.clock_type_switch = QtGui.QStackedWidget()
+        self.setup_area_1_local_clock_view()
+        self.setup_area_2_global_clock_view()
+        lay.addWidget(self.clock_type_switch)
+
+        # Keep clock area compact: allow auto-size but enforce a max height
+        self.clock_type_switch.setMaximumHeight(40)
+        self.clock_container.setMaximumHeight(80)
+
+        self.update_toggle_button_text(0)
+        self.clock_switch.stateChanged.connect(self.clock_container.setVisible)
+        self.main_layout.addWidget(self.clock_container)
+        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+
+    def toggle_clock_view(self):
+        idx = self.clock_type_switch.currentIndex()
+        new_idx = 1 if idx == 0 else 0
+        self.clock_type_switch.setCurrentIndex(new_idx)
+        self.update_toggle_button_text(new_idx)
+        self.clock_container.adjustSize()
+        self.clock_container.updateGeometry()
+
+    def update_toggle_button_text(self, idx):
+        self.clock_toggle_button.setText(
+            "Switch to Global Time" if idx == 0 else "Switch to Local Time"
+        )
+
+    def setup_area_1_local_clock_view(self):
+        w = QtGui.QWidget()
+        h = QtGui.QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+
+        f = QtGui.QFont("Monospace")
+        f.setPointSize(14)
+        self.local_time_label = QtGui.QLabel("00:00:00 PM")
+        self.local_time_label.setFont(f)
+        h.addWidget(self.local_time_label)
+
+        self.local_date_label = QtGui.QLabel("Mon Jan 01")
+        self.local_date_label.setFont(f)
+        h.addWidget(self.local_date_label)
+
+        self.clock_type_switch.addWidget(w)
+
+    def setup_area_2_global_clock_view(self):
+        w = QtGui.QWidget()
+        v = QtGui.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        h = QtGui.QHBoxLayout()
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(self.create_title_label("Zone:"))
+        self.global_zone_selector = QtGui.QComboBox()
+        self.global_zone_selector.addItems(GLOBAL_ZONES.keys())
+        self.global_zone_selector.setMaxVisibleItems(12)
+        h.addWidget(self.global_zone_selector)
+        v.addLayout(h)
+
+        h2 = QtGui.QHBoxLayout()
+        h2.setContentsMargins(0, 0, 0, 0)
+        h2.setSpacing(8)
+
+        f = QtGui.QFont("Monospace")
+        f.setPointSize(14)
+        self.global_time_label = QtGui.QLabel("00:00:00 PM")
+        self.global_time_label.setFont(f)
+        h2.addWidget(self.global_time_label)
+
+        self.global_date_label = QtGui.QLabel("Mon Jan 01")
+        self.global_date_label.setFont(f)
+        h2.addWidget(self.global_date_label)
+
+        v.addLayout(h2)
+        self.clock_type_switch.addWidget(w)
+
+    # -----------------------------------------------------------------------
+    # Timer Section – STOPWATCH
+    # -----------------------------------------------------------------------
+    def setup_timer_section(self):
+        self.timer_container = QtGui.QWidget()
+        lay = QtGui.QGridLayout(self.timer_container)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(4)
+
+        row = 0
+        lay.addWidget(self.create_title_label("Stopwatch"), row, 0, 1, 2)
+        row += 1
+
+        f = QtGui.QFont("Monospace")
+        f.setPointSize(24)
+        f.setBold(True)
+        self.stopwatch_display = QtGui.QLabel("00:00:00")
+        self.stopwatch_display.setFont(f)
+        self.stopwatch_display.setAlignment(QtCore.Qt.AlignCenter)
+        self.stopwatch_display.setStyleSheet("background-color:#222;color:#4CAF50;padding:8px;")
+        lay.addWidget(self.stopwatch_display, row, 0, 1, 2)
+        row += 1
+
+        btns = QtGui.QHBoxLayout()
+        btns.setSpacing(4)
+
+        self.stopwatch_start_button = QtGui.QPushButton("Start")
+        self.stopwatch_start_button.clicked.connect(self.stopwatch_start)
+        self.stopwatch_start_button.setStyleSheet("background-color:#4CAF50;color:white;")
+        btns.addWidget(self.stopwatch_start_button)
+
+        self.stopwatch_stop_button = QtGui.QPushButton("Stop & Log")
+        self.stopwatch_stop_button.clicked.connect(self.stopwatch_stop_and_log)
+        self.stopwatch_stop_button.setStyleSheet("background-color:#f44336;color:white;")
+        self.stopwatch_stop_button.setEnabled(False)
+        btns.addWidget(self.stopwatch_stop_button)
+
+        self.stopwatch_reset_button = QtGui.QPushButton("Reset")
+        self.stopwatch_reset_button.clicked.connect(self.stopwatch_reset)
+        btns.addWidget(self.stopwatch_reset_button)
+
+        lay.addLayout(btns, row, 0, 1, 2)
+        row += 1
+
+        lay.addWidget(self.create_title_label("Project Name:"), row, 0)
+        self.project_selector = QtGui.QComboBox()
+        self.project_selector.setEditable(True)
+        self.project_selector.addItems(self.get_open_documents())
+        self.cached_document_list = self.get_open_documents()
+        lay.addWidget(self.project_selector, row, 1)
+        row += 1
+
+        self.status_label = QtGui.QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color:#aaa;font-size:9pt;")
+        lay.addWidget(self.status_label, row, 0, 1, 2)
+        row += 1
+
+        btn_row = QtGui.QHBoxLayout()
+        btn_row.setSpacing(4)
+
+        self.view_logs_button = QtGui.QPushButton("View Logs")
+        self.view_logs_button.clicked.connect(self.view_logs)
+        self.view_logs_button.setStyleSheet("background-color:#2196F3;color:white;")
+        btn_row.addWidget(self.view_logs_button)
+
+        btn_row.addStretch()
+
+        self.edit_path_button = QtGui.QPushButton("Edit Path")
+        self.edit_path_button.clicked.connect(self.edit_file_path)
+        self.edit_path_button.setStyleSheet("background-color:#FFA500;color:black;")
+        btn_row.addWidget(self.edit_path_button)
+
+        self.open_folder_button = QtGui.QPushButton("Open Folder")
+        self.open_folder_button.clicked.connect(self.open_save_folder)
+        self.open_folder_button.setStyleSheet("background-color:#4CAF50;color:white;")
+        btn_row.addWidget(self.open_folder_button)
+
+        lay.addLayout(btn_row, row, 0, 1, 2)
+        row += 1
+
+        self.save_path_label = QtGui.QLabel(self.default_xlsx_path)
+        self.save_path_label.setWordWrap(True)
+        self.save_path_label.setStyleSheet(
+            "background-color:#4CAF50;color:white;padding:6px;"
+            "border:1px solid #45a049;border-radius:4px;font-size:8pt;"
+        )
+        self.save_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        lay.addWidget(self.save_path_label, row, 0, 1, 2)
+
+        self.timer_switch.stateChanged.connect(self.timer_container.setVisible)
+        self.main_layout.addWidget(self.timer_container)
+        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+
+    # -----------------------------------------------------------------------
+    # STOPWATCH METHODS
+    # -----------------------------------------------------------------------
+    def stopwatch_start(self):
+        if not self.stopwatch_running:
+            self.stopwatch_running = True
+            self.stopwatch_start_time = time.monotonic() - self.stopwatch_time
+            self.stopwatch_start_button.setEnabled(False)
+            self.stopwatch_stop_button.setEnabled(True)
+            self.status_label.setText("Timer running...")
+            if getattr(self, '_pending_new_file', False):
+                self._pending_new_file = False
+                from openpyxl import Workbook
+                wb = Workbook()
+                wb.save(self.default_xlsx_path)
+                self.status_label.setText(f"Created: {self.default_xlsx_path}")
+
+    def stopwatch_stop_and_log(self):
+        if not self.stopwatch_running:
+            return
+        proj = self.project_selector.currentText()
+        if not proj:
+            self.status_label.setText("Select project.")
+            return
+        elapsed = time.monotonic() - self.stopwatch_start_time
+        if elapsed < 1.0:
+            self.status_label.setText("Too short.")
+            return
+        h, m, s = int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60)
+        time_str = f"{h:02d}:{m:02d}:{s:02d}"
+        log_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.project_times.setdefault(proj, []).append((time_str, log_ts))
+        self.auto_save_to_xlsx()
+        self.status_label.setText(f"Logged {time_str} to {proj}")
+        self.stopwatch_reset()
+
+    def stopwatch_reset(self):
+        self.stopwatch_running = False
+        self.stopwatch_time = 0.0
+        self.stopwatch_start_time = 0.0
+        self.stopwatch_display.setText("00:00:00")
+        self.stopwatch_start_button.setEnabled(True)
+        self.stopwatch_stop_button.setEnabled(False)
+        self.status_label.setText("")
+
+    def stopwatch_update_display(self):
+        elapsed = time.monotonic() - self.stopwatch_start_time if self.stopwatch_running else self.stopwatch_time
+        h, m, s = int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60)
+        self.stopwatch_display.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    # -----------------------------------------------------------------------
+    # Alarm Section
+    # -----------------------------------------------------------------------
+    def setup_alarm_section(self):
+        self.alarm_container = QtGui.QWidget()
+        lay = QtGui.QVBoxLayout(self.alarm_container)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(6)
+
+        self.alarm_enable_checkbox = QtGui.QCheckBox("Enable Alarm")
+        self.alarm_enable_checkbox.stateChanged.connect(self.on_alarm_settings_changed)
+        lay.addWidget(self.alarm_enable_checkbox)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Time:"))
+        self.alarm_time_edit = QtGui.QTimeEdit()
+        self.alarm_time_edit.setDisplayFormat("HH:mm")
+        self.alarm_time_edit.setTime(QtCore.QTime.currentTime())
+        self.alarm_time_edit.timeChanged.connect(self.on_alarm_settings_changed)
+        h.addWidget(self.alarm_time_edit)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Zone:"))
+        self.alarm_zone_selector = QtGui.QComboBox()
+        self.alarm_zone_selector.addItem("Local")
+        self.alarm_zone_selector.addItems(GLOBAL_ZONES.keys())
+        self.alarm_zone_selector.currentIndexChanged.connect(self.on_alarm_settings_changed)
+        h.addWidget(self.alarm_zone_selector)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Sound:"))
+        self.alarm_sound_selector = QtGui.QComboBox()
+        h.addWidget(self.alarm_sound_selector)
+        self.alarm_sound_preview_btn = QtGui.QPushButton("Preview")
+        self.alarm_sound_preview_btn.clicked.connect(self._toggle_preview_alarm_sound)
+        h.addWidget(self.alarm_sound_preview_btn)
+        lay.addLayout(h)
+        self._populate_alarm_sounds()
+
+        lay.addWidget(QtGui.QLabel("Repeat:"))
+        self.alarm_repeat_checkboxes = []
+        days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        row = QtGui.QHBoxLayout()
+        for d in days:
+            cb = QtGui.QCheckBox(d)
+            cb.stateChanged.connect(self.on_alarm_settings_changed)
+            self.alarm_repeat_checkboxes.append(cb)
+            row.addWidget(cb)
+        lay.addLayout(row)
+
+        self.alarm_status_label = QtGui.QLabel("Alarm off")
+        self.alarm_status_label.setStyleSheet("color:#ff5252;font-weight:bold;font-size:10pt;")
+        lay.addWidget(self.alarm_status_label)
+
+        self.alarm_time_remaining_label = QtGui.QLabel("")
+        self.alarm_time_remaining_label.setStyleSheet("font-size: 9pt; color: #007700; font-weight: bold;")
+        lay.addWidget(self.alarm_time_remaining_label)
+
+        self.alarm_list_label = QtGui.QLabel()
+        self.alarm_list_label.setWordWrap(True)
+        self.alarm_list_label.setStyleSheet(
+            "background-color:#2b2b2b;color:#aaa;padding:4px;border:1px solid #444;"
+            "font-size:8pt;"
+        )
+        lay.addWidget(self.alarm_list_label)
+
+        self.alarm_switch.stateChanged.connect(self.alarm_container.setVisible)
+        self.main_layout.addWidget(self.alarm_container)
+        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+
+    # -----------------------------------------------------------------------
+    # Countdown Section
+    # -----------------------------------------------------------------------
+    def setup_countdown_section(self):
+        self.countdown_container = QtGui.QWidget()
+        lay = QtGui.QVBoxLayout(self.countdown_container)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(6)
+
+        lay.addWidget(self.create_title_label("Countdown Timer"))
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Duration:"))
+        self.countdown_time_edit = QtGui.QTimeEdit()
+        self.countdown_time_edit.setDisplayFormat("HH:mm:ss")
+        self.countdown_time_edit.setTime(QtCore.QTime(0, 10, 0))
+        self.countdown_time_edit.timeChanged.connect(self._on_countdown_time_changed)
+        h.addWidget(self.countdown_time_edit)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Sound:"))
+        self.countdown_sound_selector = QtGui.QComboBox()
+        self._populate_countdown_sounds()
+        h.addWidget(self.countdown_sound_selector)
+        lay.addLayout(h)
+
+        f = QtGui.QFont("Monospace")
+        f.setPointSize(24)
+        f.setBold(True)
+        self.countdown_display = QtGui.QLabel("00:10:00")
+        self.countdown_display.setFont(f)
+        self.countdown_display.setAlignment(QtCore.Qt.AlignCenter)
+        self.countdown_display.setStyleSheet("background-color:#222;color:#ff9800;padding:8px;")
+        lay.addWidget(self.countdown_display)
+
+        btns = QtGui.QHBoxLayout()
+        btns.setSpacing(4)
+
+        self.countdown_start_button = QtGui.QPushButton("Start")
+        self.countdown_start_button.clicked.connect(self.countdown_start)
+        btns.addWidget(self.countdown_start_button)
+
+        self.countdown_pause_button = QtGui.QPushButton("Pause")
+        self.countdown_pause_button.clicked.connect(self.countdown_pause)
+        self.countdown_pause_button.setEnabled(False)
+        btns.addWidget(self.countdown_pause_button)
+
+        self.countdown_reset_button = QtGui.QPushButton("Reset")
+        self.countdown_reset_button.clicked.connect(self.countdown_reset)
+        btns.addWidget(self.countdown_reset_button)
+
+        self.countdown_stop_alarm_button = QtGui.QPushButton("Stop Alarm")
+        self.countdown_stop_alarm_button.clicked.connect(self.stop_countdown_alarm)
+        self.countdown_stop_alarm_button.setEnabled(False)
+        btns.addWidget(self.countdown_stop_alarm_button)
+
+        lay.addLayout(btns)
+
+        self.countdown_status_label = QtGui.QLabel("")
+        self.countdown_status_label.setStyleSheet("color:#aaa;font-size:9pt;")
+        lay.addWidget(self.countdown_status_label)
+
+        self.countdown_switch.stateChanged.connect(self.countdown_container.setVisible)
+        self.countdown_container.setVisible(False)
+        self.main_layout.addWidget(self.countdown_container)
+        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+
+        self._on_countdown_time_changed()
+
+    def _on_countdown_time_changed(self):
+        t = self.countdown_time_edit.time()
+        total = t.hour() * 3600 + t.minute() * 60 + t.second()
+        self.countdown_total_seconds = total
+        self.countdown_paused_remaining = total
+        if self.countdown_running:
+            self.countdown_running = False
+            self.countdown_paused = False
+            self.countdown_start_button.setEnabled(True)
+            self.countdown_pause_button.setEnabled(False)
+            self.countdown_pause_button.setText("Pause")
+            self.countdown_status_label.setText("")
+        self.countdown_update_display()
+
+    def countdown_start(self):
+        if self.countdown_total_seconds <= 0:
+            self.countdown_status_label.setText("Set duration > 0.")
+            return
+        self.countdown_end_time = time.monotonic() + self.countdown_total_seconds
+        self.countdown_running = True
+        self.countdown_paused = False
+        self.countdown_start_button.setEnabled(False)
+        self.countdown_pause_button.setEnabled(True)
+        self.countdown_pause_button.setText("Pause")
+        self.countdown_status_label.setText("Countdown running...")
+        self.countdown_update_display()
+
+    def countdown_pause(self):
+        if self.countdown_running and not self.countdown_paused:
+            self.countdown_paused = True
+            rem = self.countdown_end_time - time.monotonic()
+            self.countdown_paused_remaining = max(0, rem)
+            self.countdown_pause_button.setText("Resume")
+            self.countdown_status_label.setText("Countdown paused.")
+        elif self.countdown_running and self.countdown_paused:
+            self.countdown_paused = False
+            self.countdown_end_time = time.monotonic() + self.countdown_paused_remaining
+            self.countdown_pause_button.setText("Pause")
+            self.countdown_status_label.setText("Countdown running...")
+
+    def countdown_reset(self):
+        t = self.countdown_time_edit.time()
+        total = t.hour() * 3600 + t.minute() * 60 + t.second()
+        self.countdown_total_seconds = total
+        self.countdown_paused_remaining = total
+        self.countdown_running = False
+        self.countdown_paused = False
+        self.countdown_start_button.setEnabled(True)
+        self.countdown_pause_button.setEnabled(False)
+        self.countdown_pause_button.setText("Pause")
+        self.countdown_status_label.setText("")
+        self.countdown_update_display()
+
+    def countdown_update_display(self):
+        rem = (self.countdown_end_time - time.monotonic()
+               if self.countdown_running and not self.countdown_paused
+               else self.countdown_paused_remaining)
+        rem = max(0, rem)
+        h, m, s = int(rem // 3600), int((rem % 3600) // 60), int(rem % 60)
+        self.countdown_display.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    def trigger_countdown_alarm(self):
+        idx = self.countdown_sound_selector.currentIndex()
+        sound_file = self._countdown_sound_files[idx] if 0 <= idx < len(self._countdown_sound_files) else None
+        if sound_file:
+            try:
+                import winsound
+                winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+            except Exception as e:
+                print(f"Sound error: {e}")
+
+        msg = QtGui.QMessageBox(self.form)
+        msg.setWindowTitle("Countdown Finished")
+        msg.setText("Time's up!")
+        stop_btn = msg.addButton("Stop Alarm", QtGui.QMessageBox.AcceptRole)
+        msg.addButton(QtGui.QMessageBox.Ok)
+        msg.exec()
+        if msg.clickedButton() == stop_btn:
+            self.stop_countdown_alarm()
+
+    def stop_countdown_alarm(self):
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except:
+            pass
+        self.countdown_stop_alarm_button.setEnabled(False)
+
+    # -----------------------------------------------------------------------
+    # Pomodoro Section
+    # -----------------------------------------------------------------------
+    def setup_pomodoro_section(self):
+        self.pomodoro_container = QtGui.QWidget()
+        lay = QtGui.QVBoxLayout(self.pomodoro_container)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(4)
+
+        lay.addWidget(self.create_title_label("Pomodoro Timer"))
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Focus:"))
+        self.pomodoro_focus_time_edit = QtGui.QTimeEdit()
+        self.pomodoro_focus_time_edit.setDisplayFormat("HH:mm:ss")
+        self.pomodoro_focus_time_edit.setTime(QtCore.QTime(0, 45, 0))
+        h.addWidget(self.pomodoro_focus_time_edit)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Break:"))
+        self.pomodoro_break_time_edit = QtGui.QTimeEdit()
+        self.pomodoro_break_time_edit.setDisplayFormat("HH:mm:ss")
+        self.pomodoro_break_time_edit.setTime(QtCore.QTime(0, 5, 0))
+        h.addWidget(self.pomodoro_break_time_edit)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Focus End:"))
+        self.pomodoro_focus_sound_selector = QtGui.QComboBox()
+        h.addWidget(self.pomodoro_focus_sound_selector)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Break End:"))
+        self.pomodoro_break_sound_selector = QtGui.QComboBox()
+        h.addWidget(self.pomodoro_break_sound_selector)
+        lay.addLayout(h)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Play Count:"))
+        self.pomodoro_play_count_spin = QtGui.QSpinBox()
+        self.pomodoro_play_count_spin.setRange(1, 10)
+        self.pomodoro_play_count_spin.setValue(1)
+        h.addWidget(self.pomodoro_play_count_spin)
+        lay.addLayout(h)
+
+        f = QtGui.QFont("Monospace")
+        f.setPointSize(22)
+        f.setBold(True)
+        self.pomodoro_display = QtGui.QLabel("00:45:00")
+        self.pomodoro_display.setFont(f)
+        self.pomodoro_display.setAlignment(QtCore.Qt.AlignCenter)
+        self.pomodoro_display.setStyleSheet("background-color:#222;color:#e53935;padding:4px;")
+        lay.addWidget(self.pomodoro_display)
+
+        btns = QtGui.QHBoxLayout()
+        btns.setSpacing(4)
+
+        self.pomodoro_start_button = QtGui.QPushButton("Start")
+        self.pomodoro_start_button.clicked.connect(self.pomodoro_start)
+        btns.addWidget(self.pomodoro_start_button)
+
+        self.pomodoro_pause_button = QtGui.QPushButton("Pause")
+        self.pomodoro_pause_button.clicked.connect(self.pomodoro_pause_resume_stop)
+        self.pomodoro_pause_button.setEnabled(False)
+        btns.addWidget(self.pomodoro_pause_button)
+
+        self.pomodoro_reset_button = QtGui.QPushButton("Reset")
+        self.pomodoro_reset_button.clicked.connect(self.pomodoro_reset)
+        btns.addWidget(self.pomodoro_reset_button)
+
+        lay.addLayout(btns)
+
+        self.pomodoro_status_label = QtGui.QLabel("")
+        self.pomodoro_status_label.setStyleSheet("color:#aaa;font-size:9pt;")
+        lay.addWidget(self.pomodoro_status_label)
+
+        self.pomodoro_switch.stateChanged.connect(self.pomodoro_container.setVisible)
+        self.pomodoro_container.setVisible(False)
+        self.main_layout.addWidget(self.pomodoro_container)
+        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+
+        self._populate_pomodoro_sounds()
+        self.pomodoro_focus_time_edit.timeChanged.connect(self._pomodoro_time_changed)
+        self.pomodoro_break_time_edit.timeChanged.connect(self._pomodoro_time_changed)
+
+    def _pomodoro_time_changed(self):
+        if not self.pomodoro_running:
+            self.pomodoro_update_display()
+
+    def pomodoro_start(self):
+        t = (self.pomodoro_focus_time_edit.time() if self.pomodoro_phase == 'focus'
+             else self.pomodoro_break_time_edit.time())
+        total = t.hour() * 3600 + t.minute() * 60 + t.second()
+        if total <= 0:
+            self.pomodoro_status_label.setText("Set duration > 0.")
+            return
+        self.pomodoro_paused_remaining = total
+        self.pomodoro_end_time = time.monotonic() + total
+        self.pomodoro_running = True
+        self.pomodoro_paused = False
+        self.pomodoro_start_button.setEnabled(False)
+        self.pomodoro_pause_button.setEnabled(True)
+        self.pomodoro_pause_button.setText("Pause")
+        self.pomodoro_status_label.setText(f"{self.pomodoro_phase.capitalize()} running...")
+        self.pomodoro_update_display()
+
+    def pomodoro_pause_resume_stop(self):
+        if not self.pomodoro_running:
+            return
+        if self.pomodoro_paused:
+            self.pomodoro_paused = False
+            self.pomodoro_end_time = time.monotonic() + self.pomodoro_paused_remaining
+            self.pomodoro_pause_button.setText("Pause")
+            self.pomodoro_status_label.setText(f"{self.pomodoro_phase.capitalize()} running...")
+            return
+        self.pomodoro_paused = True
+        rem = self.pomodoro_end_time - time.monotonic()
+        self.pomodoro_paused_remaining = max(0, rem)
+
+        self._pomodoro_sound_session_id += 1
+
+        self.pomodoro_pause_button.setText("Resume")
+        self.pomodoro_status_label.setText(f"{self.pomodoro_phase.capitalize()} paused.")
+        QtCore.QTimer.singleShot(800, lambda: self._show_stop_if_still_paused())
+
+    def _show_stop_if_still_paused(self):
+        if self.pomodoro_paused:
+            self.pomodoro_pause_button.setText("Stop")
+
+    def pomodoro_reset(self):
+        self.pomodoro_running = False
+        self.pomodoro_paused = False
+        self.pomodoro_phase = 'focus'
+        self.pomodoro_start_button.setEnabled(True)
+        self.pomodoro_pause_button.setEnabled(False)
+        self.pomodoro_pause_button.setText("Pause")
+        self.pomodoro_status_label.setText("")
+
+        self._pomodoro_sound_session_id += 1
+        self._pomodoro_sound_remaining = 0
+        self._pomodoro_current_sound_file = None
+
+        self.pomodoro_update_display()
+
+    def pomodoro_update_display(self):
+        rem = (self.pomodoro_end_time - time.monotonic()
+               if self.pomodoro_running and not self.pomodoro_paused
+               else self.pomodoro_paused_remaining)
+        rem = max(0, rem)
+        h, m, s = int(rem // 3600), int((rem % 3600) // 60), int(rem % 60)
+        self.pomodoro_display.setText(f"{h:02d}:{m:02d}:{s:02d}")
+
+    def trigger_pomodoro_sound(self, which):
+        selector = (self.pomodoro_focus_sound_selector
+                    if which == 'focus' else self.pomodoro_break_sound_selector)
+        idx = selector.currentIndex()
+        if not (0 <= idx < len(self._pomodoro_sound_files)):
+            return
+
+        sound_file = self._pomodoro_sound_files[idx]
+        play_count = self.pomodoro_play_count_spin.value()
+
+        self._pomodoro_sound_session_id += 1
+        self._pomodoro_sound_remaining = play_count
+        self._pomodoro_current_sound_file = sound_file
+
+        self._pomodoro_play_next_sound(self._pomodoro_sound_session_id)
+
+    def _pomodoro_play_next_sound(self, session_id):
+        if session_id != self._pomodoro_sound_session_id:
+            return
+
+        if self._pomodoro_sound_remaining <= 0:
+            return
+
+        try:
+            import winsound
+            import wave
+
+            duration_ms = 2000
+            try:
+                with wave.open(self._pomodoro_current_sound_file, 'rb') as wav_file:
+                    frames = wav_file.getnframes()
+                    rate = wav_file.getframerate()
+                    duration_ms = int((frames / float(rate)) * 1000)
+            except Exception as e:
+                print(f"[POMODORO] Could not get WAV duration: {e}")
+
+            winsound.PlaySound(
+                self._pomodoro_current_sound_file,
+                winsound.SND_FILENAME | winsound.SND_ASYNC
+            )
+
+            self._pomodoro_sound_remaining -= 1
+
+            gap_ms = 200
+            QtCore.QTimer.singleShot(
+                duration_ms + gap_ms,
+                lambda: self._pomodoro_play_next_sound(session_id)
+            )
+        except Exception as e:
+            print(f"[POMODORO] Sound error: {e}")
+            self._pomodoro_sound_remaining -= 1
+            QtCore.QTimer.singleShot(
+                200,
+                lambda: self._pomodoro_play_next_sound(session_id)
+            )
+
+    def _pomodoro_switch_phase(self):
+        self.pomodoro_phase = 'break' if self.pomodoro_phase == 'focus' else 'focus'
+        self.pomodoro_status_label.setText(f"{self.pomodoro_phase.capitalize()} starting...")
+        self.pomodoro_start()
+
+    # -----------------------------------------------------------------------
+    # Exam Section (auto-cycling global clock)
+    # -----------------------------------------------------------------------
+    def setup_exam_section(self):
+        self.exam_container = QtGui.QWidget()
+        lay = QtGui.QVBoxLayout(self.exam_container)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(6)
+
+        lay.addWidget(self.create_title_label("Exam Clock"))
+
+        f = QtGui.QFont("Monospace")
+        f.setPointSize(16)
+        f.setBold(True)
+        self.exam_time_label = QtGui.QLabel("00:00:00")
+        self.exam_time_label.setFont(f)
+        self.exam_time_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.exam_time_label.setStyleSheet("background-color:#222;color:#00e5ff;padding:6px;")
+        lay.addWidget(self.exam_time_label)
+
+        self.exam_zone_label = QtGui.QLabel("(zone)")
+        self.exam_zone_label.setAlignment(QtCore.Qt.AlignCenter)
+        lay.addWidget(self.exam_zone_label)
+
+        h = QtGui.QHBoxLayout()
+        h.addWidget(QtGui.QLabel("Cycle every:"))
+        self.exam_cycle_spin = QtGui.QSpinBox()
+        self.exam_cycle_spin.setRange(3, 60)
+        self.exam_cycle_spin.setValue(5)  # default 5 seconds
+        h.addWidget(self.exam_cycle_spin)
+        h.addWidget(QtGui.QLabel("sec"))
+        lay.addLayout(h)
+
+        self.exam_switch.stateChanged.connect(self.exam_container.setVisible)
+        self.exam_container.setVisible(False)
+        self.main_layout.addWidget(self.exam_container)
+        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+
+    def update_exam_clock(self):
+        zones = list(GLOBAL_ZONES.items())
+        if not zones:
+            return
+
+        cycle_sec = self.exam_cycle_spin.value()
+        if cycle_sec <= 0:
+            cycle_sec = 5
+        now = time.monotonic()
+
+        idx = int(now / cycle_sec) % len(zones)
+        self.exam_zone_index = idx
+
+        zone_name, offset = zones[idx]
+        utc = datetime.datetime.utcnow()
+        local = utc + datetime.timedelta(hours=offset)
+
+        self.exam_zone_label.setText(zone_name)
+        self.exam_time_label.setText(local.strftime("%I:%M:%S %p"))
+
+    # -----------------------------------------------------------------------
+    # Sound Population
+    # -----------------------------------------------------------------------
+    def _populate_countdown_sounds(self):
+        alarm_dir = os.path.join(os.path.dirname(self.default_xlsx_path), "Alarm_Sounds")
+        wavs = glob.glob(os.path.join(alarm_dir, "*.wav")) if os.path.isdir(alarm_dir) else []
+        self._countdown_sound_files = wavs
+        self.countdown_sound_selector.clear()
+        for f in wavs:
+            self.countdown_sound_selector.addItem(os.path.basename(f))
+        if not wavs:
+            self.countdown_sound_selector.addItem("No .wav files")
+        self.countdown_sound_selector.setEnabled(bool(wavs))
+
+    def _populate_alarm_sounds(self):
+        alarm_dir = os.path.join(os.path.dirname(self.default_xlsx_path), "Alarm_Sounds")
+        wavs = glob.glob(os.path.join(alarm_dir, "*.wav")) if os.path.isdir(alarm_dir) else []
+        self._alarm_sound_files = wavs
+        self.alarm_sound_selector.clear()
+        for f in wavs:
+            self.alarm_sound_selector.addItem(os.path.basename(f))
+        if not wavs:
+            self.alarm_sound_selector.addItem("No .wav files")
+        self.alarm_sound_selector.setEnabled(bool(wavs))
+        self.alarm_sound_preview_btn.setEnabled(bool(wavs))
+
+    def _populate_pomodoro_sounds(self):
+        alarm_dir = os.path.join(os.path.dirname(self.default_xlsx_path), "Alarm_Sounds")
+        wavs = glob.glob(os.path.join(alarm_dir, "*.wav")) if os.path.isdir(alarm_dir) else []
+        self._pomodoro_sound_files = wavs
+        for sel in (self.pomodoro_focus_sound_selector, self.pomodoro_break_sound_selector):
+            sel.clear()
+            for f in wavs:
+                sel.addItem(os.path.basename(f))
+            if not wavs:
+                sel.addItem("No .wav files")
+            sel.setEnabled(bool(wavs))
+
+    # -----------------------------------------------------------------------
+    # Alarm Monitoring
+    # -----------------------------------------------------------------------
+    def check_alarm(self):
+        if not self.alarm_enable_checkbox.isChecked():
+            self.alarm_status_label.setText("Alarm off")
+            return
+
+        target_time = self.alarm_time_edit.time()
+        zone_name = self.alarm_zone_selector.currentText()
+        is_local = zone_name == "Local"
+        offset = 0 if is_local else GLOBAL_ZONES.get(zone_name, 0)
+
+        now_utc = datetime.datetime.utcnow()
+        now_local = now_utc + datetime.timedelta(hours=offset) if not is_local else datetime.datetime.now()
+
+        current_date = now_local.date()
+        current_weekday = now_local.weekday()
+
+        target_hour = target_time.hour()
+        target_minute = target_time.minute()
+        target_dt_today = datetime.datetime.combine(
+            current_date, datetime.time(target_hour, target_minute)
+        )
+
+        active_days = [cb.isChecked() for cb in self.alarm_repeat_checkboxes]
+        have_repeats = any(active_days)
+
+        if have_repeats:
+            if not active_days[current_weekday]:
+                self.alarm_status_label.setText(f"Next: {target_time.toString('HH:mm')} ({zone_name})")
+                return
+
+            if now_local >= target_dt_today:
+                if self._alarm_last_fired_date != current_date:
+                    self._alarm_last_fired_date = current_date
+                    self.trigger_alarm()
+            else:
+                self.alarm_status_label.setText(f"Set for {target_time.toString('HH:mm')} ({zone_name})")
+            return
+
+        # One-shot today
+        if now_local >= target_dt_today:
+            if self._alarm_last_fired_date != current_date:
+                self._alarm_last_fired_date = current_date
+                self.trigger_alarm()
+        else:
+            self.alarm_status_label.setText(f"Today at {target_time.toString('HH:mm')} ({zone_name})")
+
+    def update_alarm_remaining(self):
+        if not self.alarm_enable_checkbox.isChecked():
+            self.alarm_time_remaining_label.setText("")
+            return
+
+        target_time = self.alarm_time_edit.time()
+        zone_name = self.alarm_zone_selector.currentText()
+        is_local = (zone_name == "Local")
+        offset = 0 if is_local else GLOBAL_ZONES.get(zone_name, 0)
+
+        now_utc = datetime.datetime.utcnow()
+        now_local = now_utc + datetime.timedelta(hours=offset) if not is_local else datetime.datetime.now()
+
+        active_days = [cb.isChecked() for cb in self.alarm_repeat_checkboxes]
+        target_hour = target_time.hour()
+        target_minute = target_time.minute()
+        today = now_local.date()
+        today_wd = now_local.weekday()
+
+        next_dt = None
+        days_ahead_for_label = None
+
+        if not any(active_days):
+            candidate_dt = datetime.datetime.combine(
+                today, datetime.time(target_hour, target_minute)
+            )
+            if candidate_dt <= now_local:
+                self.alarm_time_remaining_label.setText("No upcoming alarm without repeat days.")
+                return
+            next_dt = candidate_dt
+            days_ahead_for_label = 0
+        else:
+            for d in range(7):
+                wd = (today_wd + d) % 7
+                if not active_days[wd]:
+                    continue
+                candidate_date = today + datetime.timedelta(days=d)
+                candidate_dt = datetime.datetime.combine(
+                    candidate_date,
+                    datetime.time(target_hour, target_minute)
+                )
+                if d == 0 and candidate_dt <= now_local:
+                    continue
+                next_dt = candidate_dt
+                days_ahead_for_label = d
+                break
+
+            if next_dt is None:
+                self.alarm_time_remaining_label.setText("No upcoming alarm for selected days.")
+                return
+
+        diff = next_dt - now_local
+        total_seconds = int(diff.total_seconds())
+        if total_seconds < 0:
+            self.alarm_time_remaining_label.setText("No upcoming alarm for selected days.")
+            return
+
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+
+        weekday_short = next_dt.strftime("%a")
+        if days_ahead_for_label == 0:
+            when_label = f"Today ({weekday_short})"
+        elif days_ahead_for_label == 1:
+            when_label = f"Tomorrow ({weekday_short})"
+            # noqa
+        else:
+            when_label = weekday_short
+
+        time_str = next_dt.strftime("%H:%M")
+        self.alarm_time_remaining_label.setText(
+            f"Next alarm: {when_label} {time_str} "
+            f"(in {hours:02d}h {minutes:02d}m {seconds:02d}s)"
+        )
+
+    def trigger_alarm(self):
+        idx = self.alarm_sound_selector.currentIndex()
+        sound_file = self._alarm_sound_files[idx] if 0 <= idx < len(self._alarm_sound_files) else None
+        if sound_file:
+            try:
+                import winsound
+                winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+            except Exception as e:
+                print(f"Alarm sound error: {e}")
+
+        msg = QtGui.QMessageBox(self.form)
+        msg.setWindowTitle("ALARM!")
+        msg.setText("Time to wake up!")
+        stop_btn = msg.addButton("Stop Alarm", QtGui.QMessageBox.AcceptRole)
+        msg.addButton(QtGui.QMessageBox.Ok)
+        msg.exec()
+        if msg.clickedButton() == stop_btn:
+            try:
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except:
+                pass
+
+    def on_alarm_settings_changed(self, *args):
+        enabled = self.alarm_enable_checkbox.isChecked()
+        self.alarm_status_label.setText("Alarm on" if enabled else "Alarm off")
+        self._alarm_last_fired_date = None
+
+    # -----------------------------------------------------------------------
+    # Main Update Loop
+    # -----------------------------------------------------------------------
+    def update_all(self):
+        if not self.form.isVisible():
+            return
+
+        try:
+            self.update_local_clock()
+            if self.clock_type_switch.currentIndex() == 1:
+                self.update_global_clock()
+            self.stopwatch_update_display()
+
+            if self.countdown_running and not self.countdown_paused:
+                rem = self.countdown_end_time - time.monotonic()
+                if rem <= 0:
+                    self.countdown_running = False
+                    self.countdown_start_button.setEnabled(True)
+                    self.countdown_pause_button.setEnabled(False)
+                    self.countdown_status_label.setText("Finished!")
+                    self.trigger_countdown_alarm()
+                else:
+                    self.countdown_update_display()
+            else:
+                self.countdown_update_display()
+
+            if self.pomodoro_running and not self.pomodoro_paused:
+                rem = self.pomodoro_end_time - time.monotonic()
+                if rem <= 0:
+                    ended_phase = self.pomodoro_phase
+                    self._pomodoro_switch_phase()
+                    self.trigger_pomodoro_sound(ended_phase)
+                else:
+                    self.pomodoro_update_display()
+            else:
+                self.pomodoro_update_display()
+
+            if self.exam_switch.isChecked():
+                self.update_exam_clock()
+
+            self.update_project_selector_if_needed()
+            self.check_alarm()
+            self.update_alarm_remaining()
+        except Exception as e:
+            print(f"[UPDATE ERROR] {e}")
+
+    def update_local_clock(self):
+        now = datetime.datetime.now()
+        self.local_time_label.setText(now.strftime("%I:%M:%S %p"))
+        self.local_date_label.setText(now.strftime("%a %b %d"))
+
+    def update_global_clock(self):
+        zone = self.global_zone_selector.currentText()
+        offset = GLOBAL_ZONES.get(zone, 0)
+        utc = datetime.datetime.utcnow()
+        local = utc + datetime.timedelta(hours=offset)
+        self.global_time_label.setText(local.strftime("%I:%M:%S %p"))
+        self.global_date_label.setText(local.strftime("%a %b %d"))
+
+    def update_project_selector_if_needed(self):
+        docs = self.get_open_documents()
+        if docs != self.cached_document_list:
+            self.cached_document_list = docs
+            cur = self.project_selector.currentText()
+            self.project_selector.blockSignals(True)
+            self.project_selector.clear()
+            self.project_selector.addItems(docs)
+            idx = self.project_selector.findText(cur)
+            if idx >= 0:
+                self.project_selector.setCurrentIndex(idx)
+            self.project_selector.blockSignals(False)
+
+    # -----------------------------------------------------------------------
+    # Misc Actions
+    # -----------------------------------------------------------------------
+    def edit_file_path(self):
+        dlg = QtGui.QFileDialog(self.form)
+        dlg.setAcceptMode(QtGui.QFileDialog.AcceptSave)
+        dlg.setNameFilter("Excel Files (*.xlsx)")
+        dlg.setDefaultSuffix("xlsx")
+        if dlg.exec():
+            self.default_xlsx_path = dlg.selectedFiles()[0]
+            self.save_path_label.setText(self.default_xlsx_path)
+            self._pending_new_file = True
+            self.status_label.setText("Path updated.")
+
+    def open_save_folder(self):
+        folder = os.path.dirname(self.default_xlsx_path)
+        os.makedirs(folder, exist_ok=True)
+        try:
+            if platform.system() == "Windows":
+                os.startfile(folder)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            QtGui.QMessageBox.warning(self.form, "Error", str(e))
+
+    def view_logs(self):
+        self.load_existing_data()
+        dlg = QtGui.QDialog(self.form)
+        dlg.setWindowTitle("Project Time Logs")
+        dlg.resize(560, 420)
+        lay = QtGui.QVBoxLayout(dlg)
+        if not any(self.project_times.values()):
+            lay.addWidget(QtGui.QLabel("No logs yet."))
+        else:
+            total_sec = sum(
+                h * 3600 + m * 60 + s
+                for proj in self.project_times.values()
+                for dur in proj
+                for h, m, s in [map(int, dur[0].split(':'))]
+            )
+            th, tm, ts = int(total_sec // 3600), int((total_sec % 3600) // 60), int(total_sec % 60)
+            lay.addWidget(QtGui.QLabel(f"<b>Total:</b> {th:02d}:{tm:02d}:{ts:02d}"))
+            txt = QtGui.QTextEdit()
+            lines = []
+            for proj, logs in self.project_times.items():
+                if logs:
+                    lines.append(f"=== {proj} ===")
+                    lines.extend(f"  {dur} — {ts}" for dur, ts in logs)
+            txt.setPlainText("\n".join(lines))
+            txt.setReadOnly(True)
+            lay.addWidget(txt)
+        close_btn = QtGui.QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        lay.addWidget(close_btn)
+        dlg.exec()
+
+    def _toggle_preview_alarm_sound(self):
+        try:
+            import winsound
+            if getattr(self, '_alarm_preview_playing', False):
+                winsound.PlaySound(None, winsound.SND_PURGE)
+                self._alarm_preview_playing = False
+                self.alarm_sound_preview_btn.setText("Preview")
+                return
+            idx = self.alarm_sound_selector.currentIndex()
+            if 0 <= idx < len(self._alarm_sound_files):
+                path = self._alarm_sound_files[idx]
+                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+                self._alarm_preview_playing = True
+                self.alarm_sound_preview_btn.setText("Stop")
+        except Exception as e:
+            QtGui.QMessageBox.warning(self.form, "Error", f"Preview error:\n{e}")
+
+    def cleanup(self):
+        if self.timer.isActive():
+            self.timer.stop()
+
+
+# ====================================================================
+# Macro Entry Point
+# ====================================================================
+if __name__ == '__main__':
+    mw = Gui.getMainWindow()
+    dock_name = "ProjectTimeTracker_Panel"
+
+    old = mw.findChild(QtGui.QDockWidget, dock_name)
+    if old:
+        mw.removeDockWidget(old)
+        old.deleteLater()
+
+    panel = ProjectTimeTrackerPanel()
+    dock = QtGui.QDockWidget("CLOCK", mw)
+    dock.setObjectName(dock_name)
+    dock.setWidget(panel.get_form())
+    mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+    dock.show()
+    print("Clock & Time Tracker v1.9.9 loaded")
