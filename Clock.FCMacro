@@ -337,7 +337,7 @@ class ProjectTimeTrackerPanel:
         self.scroll_area = QtGui.QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
         self.scroll_area.setFrameShape(QtGui.QFrame.NoFrame)
         
         # Create scrollable content widget
@@ -1097,7 +1097,7 @@ class ProjectTimeTrackerPanel:
         self.pomodoro_display = QtGui.QLabel("00:45:00")
         self.pomodoro_display.setFont(self.font_display)
         self.pomodoro_display.setAlignment(QtCore.Qt.AlignCenter)
-        self.pomodoro_display.setStyleSheet("background-color:#222;color:#e53935;padding:4px;border-radius:3px;")
+        self.pomodoro_display.setStyleSheet("background-color:#222;color:#e53935;padding:6px;border-radius:3px;")
         self.pomodoro_display.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
         lay.addWidget(self.pomodoro_display)
 
@@ -1141,7 +1141,7 @@ class ProjectTimeTrackerPanel:
         lay.addWidget(self.pomodoro_status_label)
 
         # FIXED: Maximum height for pomodoro section
-        self.pomodoro_container.setMaximumHeight(210)
+        self.pomodoro_container.setMaximumHeight(230)
 
         self.pomodoro_switch.stateChanged.connect(self.pomodoro_container.setVisible)
         self.pomodoro_container.setVisible(False)
