@@ -1,10 +1,8 @@
-# v1.9.9 – 2025-11-17 23:45
-
 __Name__ = 'CLOCK'
 __Comment__ = 'Clock,Timer, Alarm ,Countdown,Pomodoro, Exam mode'
 __Author__ = 'AI Assistant + Imagineer'
-__Version__ = '1.0.0'
-__Date__ = '2025-11-08'
+__Version__ = '2.0.4'
+__Date__ = '2025-11-21'
 __License__ = 'MIT'
 __Web__ = 'www.youtube.com/@imagine7547'
 __Wiki__ = 'https://github.com/wpegley/CLOCK'
@@ -38,7 +36,7 @@ except ImportError:
 # --- Global Time Zones (expanded) ---
 GLOBAL_ZONES = {
     # Oceania
-    "Sydney, AU (AEST/AEDT)": 10,   # +11 during DST
+    "Sydney, AU (AEST/AEDT)": 10,   # base offset; DST applied below
     "Melbourne, AU (AEST/AEDT)": 10,
     "Brisbane, AU (AEST)": 10,
     "Perth, AU (AWST)": 8,
@@ -81,6 +79,52 @@ GLOBAL_ZONES = {
 }
 
 
+def _apply_simple_dst(utc_dt, zone_name, base_offset):
+    """Return local datetime with a simple, hard-coded DST adjustment.
+
+    This intentionally avoids external tz libraries; it only handles
+    a few common regions where the macro is likely to be used.
+    """
+    offset = base_offset
+
+    # Australia (Sydney / Melbourne): first Sunday in October to
+    # first Sunday in April, approximate rule, +1 hour.
+    if "Sydney" in zone_name or "Melbourne" in zone_name:
+        year = utc_dt.year
+        # First Sunday in October
+        first_oct = datetime.datetime(year, 10, 1)
+        first_oct_wd = first_oct.weekday()  # Mon=0..Sun=6
+        days_to_sun = (6 - first_oct_wd) % 7
+        dst_start = first_oct + datetime.timedelta(days=days_to_sun)
+
+        # First Sunday in April
+        first_apr = datetime.datetime(year, 4, 1)
+        first_apr_wd = first_apr.weekday()
+        days_to_sun_apr = (6 - first_apr_wd) % 7
+        dst_end = first_apr + datetime.timedelta(days=days_to_sun_apr)
+
+        if dst_start <= utc_dt < dst_end:
+            offset += 1
+
+    # New Zealand (Auckland): very similar rule in practice
+    if "Auckland" in zone_name:
+        year = utc_dt.year
+        first_oct = datetime.datetime(year, 10, 1)
+        first_oct_wd = first_oct.weekday()
+        days_to_sun = (6 - first_oct_wd) % 7
+        dst_start = first_oct + datetime.timedelta(days=days_to_sun)
+
+        first_apr = datetime.datetime(year, 4, 1)
+        first_apr_wd = first_apr.weekday()
+        days_to_sun_apr = (6 - first_apr_wd) % 7
+        dst_end = first_apr + datetime.timedelta(days=days_to_sun_apr)
+
+        if dst_start <= utc_dt < dst_end:
+            offset += 1
+
+    return utc_dt + datetime.timedelta(hours=offset)
+
+
 class ProjectTimeTrackerPanel:
     """Main panel class for the FreeCAD Clock & Time Tracker dock."""
     
@@ -89,10 +133,7 @@ class ProjectTimeTrackerPanel:
 
     def create_title_label(self, text):
         label = QtGui.QLabel(text)
-        font = QtGui.QFont()
-        font.setBold(True)
-        font.setPointSize(10)
-        label.setFont(font)
+        label.setFont(self.font_title)
         return label
 
     def get_open_documents(self):
@@ -173,72 +214,164 @@ class ProjectTimeTrackerPanel:
 
             header = ["Project Name", "Duration (HH:MM:SS)", "Date & Time Logged"]
             for col, txt in enumerate(header, 1):
-                ws.cell(1, col, txt)
-            for cell in ws[1]:
+                cell = ws.cell(1, col)
+                cell.value = txt
                 cell.font = Font(bold=True)
                 cell.alignment = Alignment(horizontal='center')
 
-            row = 2
-            for proj, logs in self.project_times.items():
-                for dur, ts in logs:
-                    ws.cell(row, 1, proj)
-                    ws.cell(row, 2, dur)
-                    ws.cell(row, 3, ts)
-                    row += 1
+            row_idx = 2
+            for proj in sorted(self.project_times.keys()):
+                for dur, ts in self.project_times[proj]:
+                    ws.cell(row_idx, 1).value = proj
+                    ws.cell(row_idx, 2).value = dur
+                    ws.cell(row_idx, 3).value = ts
+                    row_idx += 1
 
-            for col in ws.columns:
-                max_len = 0
-                col_letter = col[0].column_letter
-                for cell in col:
-                    try:
-                        if len(str(cell.value)) > max_len:
-                            max_len = len(str(cell.value))
-                    except:
-                        pass
-                ws.column_dimensions[col_letter].width = max_len + 2
+            for col_idx, col_letter in enumerate(['A', 'B', 'C'], 1):
+                ws.column_dimensions[col_letter].width = 20
 
             wb.save(temp_path)
+            if os.path.exists(path):
+                os.remove(path)
             shutil.move(temp_path, path)
-            print(f"Auto-saved: {path}")
+            print(f"Saved {row_idx - 2} entries to {path}")
         except Exception as e:
             print(f"Save error: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+
+    def _populate_alarm_sounds(self):
+        self._alarm_sound_files = []
+        try:
+            win_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Media')
+            if os.path.isdir(win_dir):
+                wavs = glob.glob(os.path.join(win_dir, '*.wav'))
+                self._alarm_sound_files = sorted(wavs)
+        except Exception:
+            pass
+        if not self._alarm_sound_files:
+            self._alarm_sound_files = ["(No sounds found)"]
+        self.alarm_sound_selector.clear()
+        for f in self._alarm_sound_files:
+            self.alarm_sound_selector.addItem(os.path.basename(f))
+
+    def _populate_countdown_sounds(self):
+        self._countdown_sound_files = []
+        try:
+            win_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Media')
+            if os.path.isdir(win_dir):
+                wavs = glob.glob(os.path.join(win_dir, '*.wav'))
+                self._countdown_sound_files = sorted(wavs)
+        except Exception:
+            pass
+        if not self._countdown_sound_files:
+            self._countdown_sound_files = ["(No sounds found)"]
+        self.countdown_sound_selector.clear()
+        for f in self._countdown_sound_files:
+            self.countdown_sound_selector.addItem(os.path.basename(f))
+
+    def _populate_pomodoro_sounds(self):
+        self._pomodoro_sound_files = []
+        try:
+            win_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Media')
+            if os.path.isdir(win_dir):
+                wavs = glob.glob(os.path.join(win_dir, '*.wav'))
+                self._pomodoro_sound_files = sorted(wavs)
+        except Exception:
+            pass
+        if not self._pomodoro_sound_files:
+            self._pomodoro_sound_files = ["(No sounds found)"]
+        self.pomodoro_focus_sound_selector.clear()
+        self.pomodoro_break_sound_selector.clear()
+        for f in self._pomodoro_sound_files:
+            basename = os.path.basename(f)
+            self.pomodoro_focus_sound_selector.addItem(basename)
+            self.pomodoro_break_sound_selector.addItem(basename)
 
     def __init__(self):
-        self.default_xlsx_path = self.get_default_xlsx_path()
-        self.project_times = {"No Document": []}
-        self.load_existing_data()
-
         self.form = QtGui.QWidget()
-        self.main_layout = QtGui.QVBoxLayout(self.form)
-        self.main_layout.setContentsMargins(3, 3, 3, 3)
-        self.main_layout.setSpacing(4)
-        self.main_layout.setAlignment(QtCore.Qt.AlignTop)
+        
+        # Create main layout with static header sections and scrollable content
+        main_container_layout = QtGui.QVBoxLayout(self.form)
+        main_container_layout.setContentsMargins(0, 0, 0, 0)
+        main_container_layout.setSpacing(0)
+        
+        # Static header layout for checkbox row and clock (stays visible at top)
+        self.static_header_layout = QtGui.QVBoxLayout()
+        self.static_header_layout.setContentsMargins(2, 2, 2, 0)
+        self.static_header_layout.setSpacing(1)
+        main_container_layout.addLayout(self.static_header_layout)
+        
+        # Add scroll area to handle remaining sections
+        self.scroll_area = QtGui.QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.scroll_area.setFrameShape(QtGui.QFrame.NoFrame)
+        
+        # Create scrollable content widget
+        self.content_widget = QtGui.QWidget()
+        self.main_layout = QtGui.QVBoxLayout(self.content_widget)
+        # Tight spacing throughout
+        self.main_layout.setContentsMargins(2, 1, 2, 2)
+        self.main_layout.setSpacing(1)
+        
+        self.scroll_area.setWidget(self.content_widget)
+        main_container_layout.addWidget(self.scroll_area)
+
+        # Standardized font system for consistent GUI appearance
+        # Title font: Section headers
+        self.font_title = QtGui.QFont()
+        self.font_title.setPointSize(10)
+        self.font_title.setBold(True)
+        
+        # Label font: Field labels and descriptions
+        self.font_label = QtGui.QFont()
+        self.font_label.setPointSize(9)
+        
+        # Display font: All time/clock displays (standardized)
+        self.font_display = QtGui.QFont("Monospace")
+        self.font_display.setPointSize(16)
+        self.font_display.setBold(True)
+        
+        # Status font: Status messages and info text
+        self.font_status = QtGui.QFont()
+        self.font_status.setPointSize(9)
+        
+        # Button font: All buttons (inherit system, but ensure consistency)
+        self.font_button = QtGui.QFont()
+        self.font_button.setPointSize(9)
+        self.font_button.setBold(True)
+
+        self.default_xlsx_path = self.get_default_xlsx_path()
+        self.project_times = {}
+        self.load_existing_data()
 
         self.stopwatch_running = False
         self.stopwatch_time = 0.0
         self.stopwatch_start_time = 0.0
 
+        self._alarm_last_fired_date = None
+
         self.countdown_running = False
         self.countdown_paused = False
-        self.countdown_total_seconds = 0
+        self.countdown_total_seconds = 600
+        self.countdown_paused_remaining = 600
         self.countdown_end_time = 0.0
-        self.countdown_paused_remaining = 0
 
         self.pomodoro_running = False
         self.pomodoro_paused = False
         self.pomodoro_phase = 'focus'
-        self.pomodoro_end_time = 0.0
         self.pomodoro_paused_remaining = 0
+        self.pomodoro_end_time = 0.0
 
-        # Pomodoro sound playback control
+        self._pomodoro_sound_session_id = 0
         self._pomodoro_sound_remaining = 0
         self._pomodoro_current_sound_file = None
-        self._pomodoro_sound_session_id = 0
 
-        # Alarm: track last fire date to avoid multiple triggers per day
-        self._alarm_last_fired_date = None
-
-        # Exam clock
         self.exam_zone_index = 0
 
         self.cached_document_list = []
@@ -258,8 +391,8 @@ class ProjectTimeTrackerPanel:
         self.form.destroyed.connect(self.cleanup)
 
     def setup_checkbox_row(self):
-        row = QtGui.QHBoxLayout()
-        row.setSpacing(10)
+        row = QtGui.QGridLayout()
+        row.setSpacing(6)
         switches = [
             ("Clock", True),
             ("Timer", True),
@@ -268,14 +401,18 @@ class ProjectTimeTrackerPanel:
             ("Pomodoro", False),
             ("Exam", False),
         ]
-        for name, checked in switches:
+        col = 0
+        max_columns = 3  # wrap into 2 rows on narrow docks
+        for idx, (name, checked) in enumerate(switches):
             cb = QtGui.QCheckBox(name)
             cb.setChecked(checked)
-            cb.setFont(QtGui.QFont(None, 10, QtGui.QFont.Bold))
-            row.addWidget(cb)
+            cb.setFont(self.font_title)
+            r = idx // max_columns
+            c = idx % max_columns
+            row.addWidget(cb, r, c)
             setattr(self, f"{name.lower()}_switch", cb)
-        row.addStretch()
-        self.main_layout.addLayout(row)
+        # Add to static header so it stays at top
+        self.static_header_layout.addLayout(row)
 
     # -----------------------------------------------------------------------
     # Clock Section
@@ -283,11 +420,18 @@ class ProjectTimeTrackerPanel:
     def setup_clock_section(self):
         self.clock_container = QtGui.QWidget()
         lay = QtGui.QVBoxLayout(self.clock_container)
-        lay.setContentsMargins(1, 1, 1, 1)
-        lay.setSpacing(0)
+        # FIXED: Tight spacing, no margins
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(1)
 
+        # Lean button height at 26px
         self.clock_toggle_button = QtGui.QPushButton("Switch to Global Time")
-        self.clock_toggle_button.setStyleSheet("background-color:#55aaff;color:white;padding:2px;")
+        self.clock_toggle_button.setStyleSheet(
+            "background-color:#55aaff;color:white;"
+            "padding:3px 6px;min-height:22px;max-height:26px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.clock_toggle_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         self.clock_toggle_button.clicked.connect(self.toggle_clock_view)
         lay.addWidget(self.clock_toggle_button)
 
@@ -296,14 +440,21 @@ class ProjectTimeTrackerPanel:
         self.setup_area_2_global_clock_view()
         lay.addWidget(self.clock_type_switch)
 
-        # Keep clock area compact: allow auto-size but enforce a max height
-        self.clock_type_switch.setMaximumHeight(40)
-        self.clock_container.setMaximumHeight(80)
-
+        # Increased heights for international clock display
+        self.clock_type_switch.setMaximumHeight(60)
+        # Increased overall height for better spacing
+        self.clock_container.setMaximumHeight(95)
+        
         self.update_toggle_button_text(0)
         self.clock_switch.stateChanged.connect(self.clock_container.setVisible)
-        self.main_layout.addWidget(self.clock_container)
-        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+        # Add to static header so it stays at top
+        self.static_header_layout.addWidget(self.clock_container)
+        # Separator between static header and scrollable content
+        sep = QtGui.QFrame(frameShape=QtGui.QFrame.HLine)
+        sep.setFixedHeight(1)
+        sep.setFrameShape(QtGui.QFrame.HLine)
+        sep.setStyleSheet("QFrame { border: none; background-color: #555; }")
+        self.static_header_layout.addWidget(sep)
 
     def toggle_clock_view(self):
         idx = self.clock_type_switch.currentIndex()
@@ -324,14 +475,12 @@ class ProjectTimeTrackerPanel:
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(8)
 
-        f = QtGui.QFont("Monospace")
-        f.setPointSize(14)
         self.local_time_label = QtGui.QLabel("00:00:00 PM")
-        self.local_time_label.setFont(f)
+        self.local_time_label.setFont(self.font_display)
         h.addWidget(self.local_time_label)
 
         self.local_date_label = QtGui.QLabel("Mon Jan 01")
-        self.local_date_label.setFont(f)
+        self.local_date_label.setFont(self.font_display)
         h.addWidget(self.local_date_label)
 
         self.clock_type_switch.addWidget(w)
@@ -339,8 +488,9 @@ class ProjectTimeTrackerPanel:
     def setup_area_2_global_clock_view(self):
         w = QtGui.QWidget()
         v = QtGui.QVBoxLayout(w)
+        # FIXED: Tight spacing, no extra spacers
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
+        v.setSpacing(1)
 
         h = QtGui.QHBoxLayout()
         h.setContentsMargins(0, 0, 0, 0)
@@ -351,18 +501,19 @@ class ProjectTimeTrackerPanel:
         h.addWidget(self.global_zone_selector)
         v.addLayout(h)
 
+        # Increased spacing between zone dropdown and time/date row
+        v.addSpacing(8)
+
         h2 = QtGui.QHBoxLayout()
         h2.setContentsMargins(0, 0, 0, 0)
         h2.setSpacing(8)
 
-        f = QtGui.QFont("Monospace")
-        f.setPointSize(14)
         self.global_time_label = QtGui.QLabel("00:00:00 PM")
-        self.global_time_label.setFont(f)
+        self.global_time_label.setFont(self.font_display)
         h2.addWidget(self.global_time_label)
 
         self.global_date_label = QtGui.QLabel("Mon Jan 01")
-        self.global_date_label.setFont(f)
+        self.global_date_label.setFont(self.font_display)
         h2.addWidget(self.global_date_label)
 
         v.addLayout(h2)
@@ -374,93 +525,151 @@ class ProjectTimeTrackerPanel:
     def setup_timer_section(self):
         self.timer_container = QtGui.QWidget()
         lay = QtGui.QGridLayout(self.timer_container)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(4)
+        # FIXED: Tight spacing throughout
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setHorizontalSpacing(2)
+        lay.setVerticalSpacing(1)
 
         row = 0
-        lay.addWidget(self.create_title_label("Stopwatch"), row, 0, 1, 2)
+        lay.addWidget(self.create_title_label("Timer"), row, 0, 1, 2)
         row += 1
 
-        f = QtGui.QFont("Monospace")
-        f.setPointSize(24)
-        f.setBold(True)
         self.stopwatch_display = QtGui.QLabel("00:00:00")
-        self.stopwatch_display.setFont(f)
+        self.stopwatch_display.setFont(self.font_display)
         self.stopwatch_display.setAlignment(QtCore.Qt.AlignCenter)
-        self.stopwatch_display.setStyleSheet("background-color:#222;color:#4CAF50;padding:8px;")
+        self.stopwatch_display.setStyleSheet("background-color:#222;color:#4CAF50;padding:4px;border-radius:3px;")
+        # Allow display to shrink horizontally with the dock
+        self.stopwatch_display.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
         lay.addWidget(self.stopwatch_display, row, 0, 1, 2)
         row += 1
 
-        btns = QtGui.QHBoxLayout()
-        btns.setSpacing(4)
+        btns = QtGui.QGridLayout()
+        btns.setHorizontalSpacing(2)
+        btns.setVerticalSpacing(0)
 
+        # Lean button heights at 24px
         self.stopwatch_start_button = QtGui.QPushButton("Start")
         self.stopwatch_start_button.clicked.connect(self.stopwatch_start)
-        self.stopwatch_start_button.setStyleSheet("background-color:#4CAF50;color:white;")
-        btns.addWidget(self.stopwatch_start_button)
+        self.stopwatch_start_button.setStyleSheet(
+            "background-color:#4CAF50;color:white;"
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.stopwatch_start_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
+        btns.addWidget(self.stopwatch_start_button, 0, 0)
 
-        self.stopwatch_stop_button = QtGui.QPushButton("Stop & Log")
+        self.stopwatch_stop_button = QtGui.QPushButton("Stop")
         self.stopwatch_stop_button.clicked.connect(self.stopwatch_stop_and_log)
-        self.stopwatch_stop_button.setStyleSheet("background-color:#f44336;color:white;")
+        self.stopwatch_stop_button.setStyleSheet(
+            "background-color:#f44336;color:white;"
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.stopwatch_stop_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         self.stopwatch_stop_button.setEnabled(False)
-        btns.addWidget(self.stopwatch_stop_button)
+        btns.addWidget(self.stopwatch_stop_button, 0, 1)
 
         self.stopwatch_reset_button = QtGui.QPushButton("Reset")
         self.stopwatch_reset_button.clicked.connect(self.stopwatch_reset)
-        btns.addWidget(self.stopwatch_reset_button)
+        self.stopwatch_reset_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.stopwatch_reset_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
+        btns.addWidget(self.stopwatch_reset_button, 0, 2)
 
         lay.addLayout(btns, row, 0, 1, 2)
         row += 1
 
-        lay.addWidget(self.create_title_label("Project Name:"), row, 0)
+        proj_row = QtGui.QHBoxLayout()
+        proj_row.setSpacing(2)
+        proj_label = self.create_title_label("Proj:")
+        proj_label.setSizePolicy(QtGui.QSizePolicy.Fixed, QtGui.QSizePolicy.Preferred)
+        proj_row.addWidget(proj_label)
+
         self.project_selector = QtGui.QComboBox()
         self.project_selector.setEditable(True)
         self.project_selector.addItems(self.get_open_documents())
         self.cached_document_list = self.get_open_documents()
-        lay.addWidget(self.project_selector, row, 1)
+        self.project_selector.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
+        # Let project selector compress horizontally instead of forcing wide dock
+        try:
+            self.project_selector.setSizeAdjustPolicy(self.project_selector.AdjustToMinimumContentsLength)
+            self.project_selector.setMinimumContentsLength(4)
+        except Exception:
+            # Older/variant Qt bindings may not expose this enum; fall back silently.
+            pass
+        proj_row.addWidget(self.project_selector)
+        lay.addLayout(proj_row, row, 0, 1, 2)
         row += 1
 
+        # Removed dedicated status row to keep timer section compact
         self.status_label = QtGui.QLabel("")
+        self.status_label.setFont(self.font_status)
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color:#aaa;font-size:9pt;")
-        lay.addWidget(self.status_label, row, 0, 1, 2)
-        row += 1
+        self.status_label.setStyleSheet("color:#aaa;")
+        self.status_label.setSizePolicy(QtGui.QSizePolicy.Ignored, QtGui.QSizePolicy.Preferred)
 
-        btn_row = QtGui.QHBoxLayout()
-        btn_row.setSpacing(4)
+        btn_row = QtGui.QGridLayout()
+        btn_row.setHorizontalSpacing(2)
+        btn_row.setVerticalSpacing(0)
 
-        self.view_logs_button = QtGui.QPushButton("View Logs")
+        # Lean button heights at 24px
+        self.view_logs_button = QtGui.QPushButton("Logs")
         self.view_logs_button.clicked.connect(self.view_logs)
-        self.view_logs_button.setStyleSheet("background-color:#2196F3;color:white;")
-        btn_row.addWidget(self.view_logs_button)
+        self.view_logs_button.setStyleSheet(
+            "background-color:#2196F3;color:white;"
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.view_logs_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
+        btn_row.addWidget(self.view_logs_button, 0, 0)
 
-        btn_row.addStretch()
-
-        self.edit_path_button = QtGui.QPushButton("Edit Path")
+        self.edit_path_button = QtGui.QPushButton("Path")
         self.edit_path_button.clicked.connect(self.edit_file_path)
-        self.edit_path_button.setStyleSheet("background-color:#FFA500;color:black;")
-        btn_row.addWidget(self.edit_path_button)
+        self.edit_path_button.setStyleSheet(
+            "background-color:#FFA500;color:black;"
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.edit_path_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
+        btn_row.addWidget(self.edit_path_button, 0, 1)
 
-        self.open_folder_button = QtGui.QPushButton("Open Folder")
+        self.open_folder_button = QtGui.QPushButton("Folder")
         self.open_folder_button.clicked.connect(self.open_save_folder)
-        self.open_folder_button.setStyleSheet("background-color:#4CAF50;color:white;")
-        btn_row.addWidget(self.open_folder_button)
+        self.open_folder_button.setStyleSheet(
+            "background-color:#4CAF50;color:white;"
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.open_folder_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
+        btn_row.addWidget(self.open_folder_button, 0, 2)
 
         lay.addLayout(btn_row, row, 0, 1, 2)
         row += 1
 
         self.save_path_label = QtGui.QLabel(self.default_xlsx_path)
+        self.save_path_label.setFont(self.font_status)
         self.save_path_label.setWordWrap(True)
         self.save_path_label.setStyleSheet(
             "background-color:#4CAF50;color:white;padding:6px;"
-            "border:1px solid #45a049;border-radius:4px;font-size:8pt;"
+            "border:1px solid #45a049;border-radius:4px;"
         )
         self.save_path_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         lay.addWidget(self.save_path_label, row, 0, 1, 2)
+        self.save_path_label.setMaximumHeight(self.save_path_label.fontMetrics().lineSpacing() * 5)
 
+        # FIXED: Maximum height for timer section
+        self.timer_container.setMaximumHeight(260)
+        
         self.timer_switch.stateChanged.connect(self.timer_container.setVisible)
         self.main_layout.addWidget(self.timer_container)
-        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+        # FIXED: 1 row separator between sections
+        sep_timer = QtGui.QFrame(frameShape=QtGui.QFrame.HLine)
+        sep_timer.setFixedHeight(1)
+        sep_timer.setFrameShape(QtGui.QFrame.HLine)
+        sep_timer.setStyleSheet("QFrame { border: none; background-color: #555; }")
+        self.main_layout.addWidget(sep_timer)
 
     # -----------------------------------------------------------------------
     # STOPWATCH METHODS
@@ -518,15 +727,19 @@ class ProjectTimeTrackerPanel:
     def setup_alarm_section(self):
         self.alarm_container = QtGui.QWidget()
         lay = QtGui.QVBoxLayout(self.alarm_container)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(6)
+        # FIXED: Tight spacing
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(1)
 
         self.alarm_enable_checkbox = QtGui.QCheckBox("Enable Alarm")
+        self.alarm_enable_checkbox.setFont(self.font_label)
         self.alarm_enable_checkbox.stateChanged.connect(self.on_alarm_settings_changed)
         lay.addWidget(self.alarm_enable_checkbox)
 
         h = QtGui.QHBoxLayout()
-        h.addWidget(QtGui.QLabel("Time:"))
+        lbl_time = QtGui.QLabel("Time:")
+        lbl_time.setFont(self.font_label)
+        h.addWidget(lbl_time)
         self.alarm_time_edit = QtGui.QTimeEdit()
         self.alarm_time_edit.setDisplayFormat("HH:mm")
         self.alarm_time_edit.setTime(QtCore.QTime.currentTime())
@@ -535,54 +748,80 @@ class ProjectTimeTrackerPanel:
         lay.addLayout(h)
 
         h = QtGui.QHBoxLayout()
-        h.addWidget(QtGui.QLabel("Zone:"))
+        lbl_zone = QtGui.QLabel("Zone:")
+        lbl_zone.setFont(self.font_label)
+        h.addWidget(lbl_zone)
         self.alarm_zone_selector = QtGui.QComboBox()
         self.alarm_zone_selector.addItem("Local")
         self.alarm_zone_selector.addItems(GLOBAL_ZONES.keys())
+        self.alarm_zone_selector.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         self.alarm_zone_selector.currentIndexChanged.connect(self.on_alarm_settings_changed)
         h.addWidget(self.alarm_zone_selector)
         lay.addLayout(h)
 
         h = QtGui.QHBoxLayout()
-        h.addWidget(QtGui.QLabel("Sound:"))
+        lbl_sound = QtGui.QLabel("Sound:")
+        lbl_sound.setFont(self.font_label)
+        h.addWidget(lbl_sound)
         self.alarm_sound_selector = QtGui.QComboBox()
+        self.alarm_sound_selector.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         h.addWidget(self.alarm_sound_selector)
+        
+        # Lean button height
         self.alarm_sound_preview_btn = QtGui.QPushButton("Preview")
+        self.alarm_sound_preview_btn.setStyleSheet(
+            "padding:2px 6px;min-height:20px;max-height:24px;"
+            "border-radius:3px;"
+        )
+        self.alarm_sound_preview_btn.setSizePolicy(QtGui.QSizePolicy.Fixed, QtGui.QSizePolicy.Fixed)
         self.alarm_sound_preview_btn.clicked.connect(self._toggle_preview_alarm_sound)
         h.addWidget(self.alarm_sound_preview_btn)
         lay.addLayout(h)
         self._populate_alarm_sounds()
 
-        lay.addWidget(QtGui.QLabel("Repeat:"))
+        lbl_repeat = QtGui.QLabel("Repeat:")
+        lbl_repeat.setFont(self.font_label)
+        lay.addWidget(lbl_repeat)
         self.alarm_repeat_checkboxes = []
         days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         row = QtGui.QHBoxLayout()
         for d in days:
             cb = QtGui.QCheckBox(d)
+            cb.setFont(self.font_label)
             cb.stateChanged.connect(self.on_alarm_settings_changed)
             self.alarm_repeat_checkboxes.append(cb)
             row.addWidget(cb)
         lay.addLayout(row)
 
         self.alarm_status_label = QtGui.QLabel("Alarm off")
-        self.alarm_status_label.setStyleSheet("color:#ff5252;font-weight:bold;font-size:10pt;")
+        self.alarm_status_label.setFont(self.font_status)
+        self.alarm_status_label.setStyleSheet("color:#ff5252;font-weight:bold;")
         lay.addWidget(self.alarm_status_label)
 
         self.alarm_time_remaining_label = QtGui.QLabel("")
-        self.alarm_time_remaining_label.setStyleSheet("font-size: 9pt; color: #007700; font-weight: bold;")
+        self.alarm_time_remaining_label.setFont(self.font_status)
+        self.alarm_time_remaining_label.setStyleSheet("color:#007700;font-weight:bold;")
         lay.addWidget(self.alarm_time_remaining_label)
 
         self.alarm_list_label = QtGui.QLabel()
+        self.alarm_list_label.setFont(self.font_status)
         self.alarm_list_label.setWordWrap(True)
         self.alarm_list_label.setStyleSheet(
-            "background-color:#2b2b2b;color:#aaa;padding:4px;border:1px solid #444;"
-            "font-size:8pt;"
+            "background-color:#2b2b2b;color:#aaa;padding:3px;border:1px solid #444;"
         )
         lay.addWidget(self.alarm_list_label)
 
+        # FIXED: Maximum height for alarm section
+        self.alarm_container.setMaximumHeight(190)
+        
         self.alarm_switch.stateChanged.connect(self.alarm_container.setVisible)
         self.main_layout.addWidget(self.alarm_container)
-        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+        # FIXED: 1 row separator between sections
+        sep_alarm = QtGui.QFrame(frameShape=QtGui.QFrame.HLine)
+        sep_alarm.setFixedHeight(1)
+        sep_alarm.setFrameShape(QtGui.QFrame.HLine)
+        sep_alarm.setStyleSheet("QFrame { border: none; background-color: #555; }")
+        self.main_layout.addWidget(sep_alarm)
 
     # -----------------------------------------------------------------------
     # Countdown Section
@@ -590,13 +829,16 @@ class ProjectTimeTrackerPanel:
     def setup_countdown_section(self):
         self.countdown_container = QtGui.QWidget()
         lay = QtGui.QVBoxLayout(self.countdown_container)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(6)
+        # FIXED: Tight spacing
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(1)
 
         lay.addWidget(self.create_title_label("Countdown Timer"))
 
         h = QtGui.QHBoxLayout()
-        h.addWidget(QtGui.QLabel("Duration:"))
+        lbl_dur = QtGui.QLabel("Duration:")
+        lbl_dur.setFont(self.font_label)
+        h.addWidget(lbl_dur)
         self.countdown_time_edit = QtGui.QTimeEdit()
         self.countdown_time_edit.setDisplayFormat("HH:mm:ss")
         self.countdown_time_edit.setTime(QtCore.QTime(0, 10, 0))
@@ -605,52 +847,83 @@ class ProjectTimeTrackerPanel:
         lay.addLayout(h)
 
         h = QtGui.QHBoxLayout()
-        h.addWidget(QtGui.QLabel("Sound:"))
+        lbl_sound = QtGui.QLabel("Sound:")
+        lbl_sound.setFont(self.font_label)
+        h.addWidget(lbl_sound)
         self.countdown_sound_selector = QtGui.QComboBox()
+        self.countdown_sound_selector.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         self._populate_countdown_sounds()
         h.addWidget(self.countdown_sound_selector)
         lay.addLayout(h)
 
-        f = QtGui.QFont("Monospace")
-        f.setPointSize(24)
-        f.setBold(True)
         self.countdown_display = QtGui.QLabel("00:10:00")
-        self.countdown_display.setFont(f)
+        self.countdown_display.setFont(self.font_display)
         self.countdown_display.setAlignment(QtCore.Qt.AlignCenter)
-        self.countdown_display.setStyleSheet("background-color:#222;color:#ff9800;padding:8px;")
+        self.countdown_display.setStyleSheet("background-color:#222;color:#ff9800;padding:4px;border-radius:3px;")
+        self.countdown_display.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
         lay.addWidget(self.countdown_display)
 
         btns = QtGui.QHBoxLayout()
         btns.setSpacing(4)
 
+        # Lean button heights at 24px
         self.countdown_start_button = QtGui.QPushButton("Start")
         self.countdown_start_button.clicked.connect(self.countdown_start)
+        self.countdown_start_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.countdown_start_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.countdown_start_button)
 
         self.countdown_pause_button = QtGui.QPushButton("Pause")
         self.countdown_pause_button.clicked.connect(self.countdown_pause)
         self.countdown_pause_button.setEnabled(False)
+        self.countdown_pause_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.countdown_pause_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.countdown_pause_button)
 
         self.countdown_reset_button = QtGui.QPushButton("Reset")
         self.countdown_reset_button.clicked.connect(self.countdown_reset)
+        self.countdown_reset_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.countdown_reset_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.countdown_reset_button)
 
-        self.countdown_stop_alarm_button = QtGui.QPushButton("Stop Alarm")
+        self.countdown_stop_alarm_button = QtGui.QPushButton("Stop")
         self.countdown_stop_alarm_button.clicked.connect(self.stop_countdown_alarm)
         self.countdown_stop_alarm_button.setEnabled(False)
+        self.countdown_stop_alarm_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.countdown_stop_alarm_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.countdown_stop_alarm_button)
 
         lay.addLayout(btns)
 
         self.countdown_status_label = QtGui.QLabel("")
-        self.countdown_status_label.setStyleSheet("color:#aaa;font-size:9pt;")
+        self.countdown_status_label.setFont(self.font_status)
+        self.countdown_status_label.setStyleSheet("color:#aaa;")
         lay.addWidget(self.countdown_status_label)
+
+        # FIXED: Maximum height for countdown section
+        self.countdown_container.setMaximumHeight(170)
 
         self.countdown_switch.stateChanged.connect(self.countdown_container.setVisible)
         self.countdown_container.setVisible(False)
         self.main_layout.addWidget(self.countdown_container)
-        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+        # FIXED: 1 row separator between sections
+        sep_countdown = QtGui.QFrame(frameShape=QtGui.QFrame.HLine)
+        sep_countdown.setFixedHeight(1)
+        sep_countdown.setFrameShape(QtGui.QFrame.HLine)
+        sep_countdown.setStyleSheet("QFrame { border: none; background-color: #555; }")
+        self.main_layout.addWidget(sep_countdown)
 
         self._on_countdown_time_changed()
 
@@ -748,8 +1021,9 @@ class ProjectTimeTrackerPanel:
     def setup_pomodoro_section(self):
         self.pomodoro_container = QtGui.QWidget()
         lay = QtGui.QVBoxLayout(self.pomodoro_container)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(4)
+        # FIXED: Tight spacing
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(1)
 
         lay.addWidget(self.create_title_label("Pomodoro Timer"))
 
@@ -789,41 +1063,64 @@ class ProjectTimeTrackerPanel:
         h.addWidget(self.pomodoro_play_count_spin)
         lay.addLayout(h)
 
-        f = QtGui.QFont("Monospace")
-        f.setPointSize(22)
-        f.setBold(True)
         self.pomodoro_display = QtGui.QLabel("00:45:00")
-        self.pomodoro_display.setFont(f)
+        self.pomodoro_display.setFont(self.font_display)
         self.pomodoro_display.setAlignment(QtCore.Qt.AlignCenter)
-        self.pomodoro_display.setStyleSheet("background-color:#222;color:#e53935;padding:4px;")
+        self.pomodoro_display.setStyleSheet("background-color:#222;color:#e53935;padding:4px;border-radius:3px;")
+        self.pomodoro_display.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
         lay.addWidget(self.pomodoro_display)
 
         btns = QtGui.QHBoxLayout()
         btns.setSpacing(4)
 
+        # Lean button heights at 24px for better proportion
         self.pomodoro_start_button = QtGui.QPushButton("Start")
         self.pomodoro_start_button.clicked.connect(self.pomodoro_start)
+        self.pomodoro_start_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.pomodoro_start_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.pomodoro_start_button)
 
         self.pomodoro_pause_button = QtGui.QPushButton("Pause")
         self.pomodoro_pause_button.clicked.connect(self.pomodoro_pause_resume_stop)
         self.pomodoro_pause_button.setEnabled(False)
+        self.pomodoro_pause_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.pomodoro_pause_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.pomodoro_pause_button)
 
         self.pomodoro_reset_button = QtGui.QPushButton("Reset")
         self.pomodoro_reset_button.clicked.connect(self.pomodoro_reset)
+        self.pomodoro_reset_button.setStyleSheet(
+            "padding:3px 6px;min-height:20px;max-height:24px;"
+            "font-weight:bold;border-radius:3px;"
+        )
+        self.pomodoro_reset_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btns.addWidget(self.pomodoro_reset_button)
 
         lay.addLayout(btns)
 
         self.pomodoro_status_label = QtGui.QLabel("")
-        self.pomodoro_status_label.setStyleSheet("color:#aaa;font-size:9pt;")
+        self.pomodoro_status_label.setFont(self.font_status)
+        self.pomodoro_status_label.setStyleSheet("color:#aaa;")
         lay.addWidget(self.pomodoro_status_label)
+
+        # FIXED: Maximum height for pomodoro section
+        self.pomodoro_container.setMaximumHeight(210)
 
         self.pomodoro_switch.stateChanged.connect(self.pomodoro_container.setVisible)
         self.pomodoro_container.setVisible(False)
         self.main_layout.addWidget(self.pomodoro_container)
-        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+        # FIXED: 1 row separator between sections
+        sep_pomodoro = QtGui.QFrame(frameShape=QtGui.QFrame.HLine)
+        sep_pomodoro.setFixedHeight(1)
+        sep_pomodoro.setFrameShape(QtGui.QFrame.HLine)
+        sep_pomodoro.setStyleSheet("QFrame { border: none; background-color: #555; }")
+        self.main_layout.addWidget(sep_pomodoro)
 
         self._populate_pomodoro_sounds()
         self.pomodoro_focus_time_edit.timeChanged.connect(self._pomodoro_time_changed)
@@ -923,39 +1220,37 @@ class ProjectTimeTrackerPanel:
             import winsound
             import wave
 
-            duration_ms = 2000
-            try:
-                with wave.open(self._pomodoro_current_sound_file, 'rb') as wav_file:
-                    frames = wav_file.getnframes()
-                    rate = wav_file.getframerate()
-                    duration_ms = int((frames / float(rate)) * 1000)
-            except Exception as e:
-                print(f"[POMODORO] Could not get WAV duration: {e}")
+            sound_file = self._pomodoro_current_sound_file
+            if not sound_file or not os.path.exists(sound_file):
+                return
 
-            winsound.PlaySound(
-                self._pomodoro_current_sound_file,
-                winsound.SND_FILENAME | winsound.SND_ASYNC
-            )
+            with wave.open(sound_file, 'r') as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                duration_ms = int((frames / float(rate)) * 1000)
 
+            winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
             self._pomodoro_sound_remaining -= 1
 
-            gap_ms = 200
-            QtCore.QTimer.singleShot(
-                duration_ms + gap_ms,
-                lambda: self._pomodoro_play_next_sound(session_id)
-            )
+            QtCore.QTimer.singleShot(duration_ms + 50, lambda: self._pomodoro_play_next_sound(session_id))
         except Exception as e:
-            print(f"[POMODORO] Sound error: {e}")
-            self._pomodoro_sound_remaining -= 1
-            QtCore.QTimer.singleShot(
-                200,
-                lambda: self._pomodoro_play_next_sound(session_id)
-            )
+            print(f"Pomodoro sound error: {e}")
 
     def _pomodoro_switch_phase(self):
-        self.pomodoro_phase = 'break' if self.pomodoro_phase == 'focus' else 'focus'
-        self.pomodoro_status_label.setText(f"{self.pomodoro_phase.capitalize()} starting...")
-        self.pomodoro_start()
+        if self.pomodoro_phase == 'focus':
+            self.pomodoro_phase = 'break'
+            t = self.pomodoro_break_time_edit.time()
+        else:
+            self.pomodoro_phase = 'focus'
+            t = self.pomodoro_focus_time_edit.time()
+        total = t.hour() * 3600 + t.minute() * 60 + t.second()
+        self.pomodoro_paused_remaining = total
+        self.pomodoro_end_time = time.monotonic() + total
+        self.pomodoro_running = True
+        self.pomodoro_paused = False
+        self.pomodoro_pause_button.setText("Pause")
+        self.pomodoro_status_label.setText(f"{self.pomodoro_phase.capitalize()} running...")
+        self.pomodoro_update_display()
 
     # -----------------------------------------------------------------------
     # Exam Section (auto-cycling global clock)
@@ -963,37 +1258,49 @@ class ProjectTimeTrackerPanel:
     def setup_exam_section(self):
         self.exam_container = QtGui.QWidget()
         lay = QtGui.QVBoxLayout(self.exam_container)
-        lay.setContentsMargins(3, 3, 3, 3)
-        lay.setSpacing(6)
+        # FIXED: Tight spacing
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.setSpacing(1)
 
         lay.addWidget(self.create_title_label("Exam Clock"))
 
-        f = QtGui.QFont("Monospace")
-        f.setPointSize(16)
-        f.setBold(True)
         self.exam_time_label = QtGui.QLabel("00:00:00")
-        self.exam_time_label.setFont(f)
+        self.exam_time_label.setFont(self.font_display)
         self.exam_time_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.exam_time_label.setStyleSheet("background-color:#222;color:#00e5ff;padding:6px;")
+        self.exam_time_label.setStyleSheet("background-color:#222;color:#00e5ff;padding:6px;border-radius:3px;")
         lay.addWidget(self.exam_time_label)
 
         self.exam_zone_label = QtGui.QLabel("(zone)")
+        self.exam_zone_label.setFont(self.font_label)
         self.exam_zone_label.setAlignment(QtCore.Qt.AlignCenter)
         lay.addWidget(self.exam_zone_label)
 
         h = QtGui.QHBoxLayout()
-        h.addWidget(QtGui.QLabel("Cycle every:"))
+        h.setSpacing(2)
+        lbl = QtGui.QLabel("Cycle every:")
+        lbl.setFont(self.font_label)
+        h.addWidget(lbl)
         self.exam_cycle_spin = QtGui.QSpinBox()
         self.exam_cycle_spin.setRange(3, 60)
         self.exam_cycle_spin.setValue(5)  # default 5 seconds
         h.addWidget(self.exam_cycle_spin)
-        h.addWidget(QtGui.QLabel("sec"))
+        lbl2 = QtGui.QLabel("sec")
+        lbl2.setFont(self.font_label)
+        h.addWidget(lbl2)
         lay.addLayout(h)
+
+        # FIXED: Maximum height for exam section
+        self.exam_container.setMaximumHeight(110)
 
         self.exam_switch.stateChanged.connect(self.exam_container.setVisible)
         self.exam_container.setVisible(False)
         self.main_layout.addWidget(self.exam_container)
-        self.main_layout.addWidget(QtGui.QFrame(frameShape=QtGui.QFrame.HLine))
+        # FIXED: 1 row separator between sections
+        sep_exam = QtGui.QFrame(frameShape=QtGui.QFrame.HLine)
+        sep_exam.setFixedHeight(1)
+        sep_exam.setFrameShape(QtGui.QFrame.HLine)
+        sep_exam.setStyleSheet("QFrame { border: none; background-color: #555; }")
+        self.main_layout.addWidget(sep_exam)
 
     def update_exam_clock(self):
         zones = list(GLOBAL_ZONES.items())
@@ -1016,149 +1323,97 @@ class ProjectTimeTrackerPanel:
         self.exam_time_label.setText(local.strftime("%I:%M:%S %p"))
 
     # -----------------------------------------------------------------------
-    # Sound Population
-    # -----------------------------------------------------------------------
-    def _populate_countdown_sounds(self):
-        alarm_dir = os.path.join(os.path.dirname(self.default_xlsx_path), "Alarm_Sounds")
-        wavs = glob.glob(os.path.join(alarm_dir, "*.wav")) if os.path.isdir(alarm_dir) else []
-        self._countdown_sound_files = wavs
-        self.countdown_sound_selector.clear()
-        for f in wavs:
-            self.countdown_sound_selector.addItem(os.path.basename(f))
-        if not wavs:
-            self.countdown_sound_selector.addItem("No .wav files")
-        self.countdown_sound_selector.setEnabled(bool(wavs))
-
-    def _populate_alarm_sounds(self):
-        alarm_dir = os.path.join(os.path.dirname(self.default_xlsx_path), "Alarm_Sounds")
-        wavs = glob.glob(os.path.join(alarm_dir, "*.wav")) if os.path.isdir(alarm_dir) else []
-        self._alarm_sound_files = wavs
-        self.alarm_sound_selector.clear()
-        for f in wavs:
-            self.alarm_sound_selector.addItem(os.path.basename(f))
-        if not wavs:
-            self.alarm_sound_selector.addItem("No .wav files")
-        self.alarm_sound_selector.setEnabled(bool(wavs))
-        self.alarm_sound_preview_btn.setEnabled(bool(wavs))
-
-    def _populate_pomodoro_sounds(self):
-        alarm_dir = os.path.join(os.path.dirname(self.default_xlsx_path), "Alarm_Sounds")
-        wavs = glob.glob(os.path.join(alarm_dir, "*.wav")) if os.path.isdir(alarm_dir) else []
-        self._pomodoro_sound_files = wavs
-        for sel in (self.pomodoro_focus_sound_selector, self.pomodoro_break_sound_selector):
-            sel.clear()
-            for f in wavs:
-                sel.addItem(os.path.basename(f))
-            if not wavs:
-                sel.addItem("No .wav files")
-            sel.setEnabled(bool(wavs))
-
-    # -----------------------------------------------------------------------
-    # Alarm Monitoring
+    # Alarm Checking Logic
     # -----------------------------------------------------------------------
     def check_alarm(self):
         if not self.alarm_enable_checkbox.isChecked():
-            self.alarm_status_label.setText("Alarm off")
+            self.alarm_time_remaining_label.setText("")
             return
 
-        target_time = self.alarm_time_edit.time()
-        zone_name = self.alarm_zone_selector.currentText()
-        is_local = zone_name == "Local"
-        offset = 0 if is_local else GLOBAL_ZONES.get(zone_name, 0)
-
-        now_utc = datetime.datetime.utcnow()
-        now_local = now_utc + datetime.timedelta(hours=offset) if not is_local else datetime.datetime.now()
-
-        current_date = now_local.date()
-        current_weekday = now_local.weekday()
-
-        target_hour = target_time.hour()
-        target_minute = target_time.minute()
-        target_dt_today = datetime.datetime.combine(
-            current_date, datetime.time(target_hour, target_minute)
-        )
-
-        active_days = [cb.isChecked() for cb in self.alarm_repeat_checkboxes]
-        have_repeats = any(active_days)
-
-        if have_repeats:
-            if not active_days[current_weekday]:
-                self.alarm_status_label.setText(f"Next: {target_time.toString('HH:mm')} ({zone_name})")
-                return
-
-            if now_local >= target_dt_today:
-                if self._alarm_last_fired_date != current_date:
-                    self._alarm_last_fired_date = current_date
-                    self.trigger_alarm()
-            else:
-                self.alarm_status_label.setText(f"Set for {target_time.toString('HH:mm')} ({zone_name})")
-            return
-
-        # One-shot today
-        if now_local >= target_dt_today:
-            if self._alarm_last_fired_date != current_date:
-                self._alarm_last_fired_date = current_date
-                self.trigger_alarm()
+        zone = self.alarm_zone_selector.currentText()
+        if zone == "Local":
+            now = datetime.datetime.now()
         else:
-            self.alarm_status_label.setText(f"Today at {target_time.toString('HH:mm')} ({zone_name})")
+            utc = datetime.datetime.utcnow()
+            base_offset = GLOBAL_ZONES.get(zone, 0)
+            now = _apply_simple_dst(utc, zone, base_offset)
+
+        alarm_time = self.alarm_time_edit.time()
+        alarm_dt = now.replace(hour=alarm_time.hour(), minute=alarm_time.minute(), second=0, microsecond=0)
+
+        checked_days = [i for i, cb in enumerate(self.alarm_repeat_checkboxes) if cb.isChecked()]
+        if not checked_days:
+            if alarm_dt <= now:
+                alarm_dt += datetime.timedelta(days=1)
+            if alarm_dt <= now or alarm_dt.date() == self._alarm_last_fired_date:
+                self.alarm_time_remaining_label.setText("")
+                return
+            if now.date() == alarm_dt.date() and now >= alarm_dt:
+                if self._alarm_last_fired_date != now.date():
+                    self.trigger_alarm()
+                    self._alarm_last_fired_date = now.date()
+        else:
+            today_weekday = now.weekday()
+            candidates = []
+            for d in checked_days:
+                days_ahead = (d - today_weekday) % 7
+                candidate = alarm_dt + datetime.timedelta(days=days_ahead)
+                if days_ahead == 0 and candidate <= now:
+                    candidate += datetime.timedelta(days=7)
+                candidates.append(candidate)
+            candidates.sort()
+            next_alarm = candidates[0] if candidates else None
+            if not next_alarm:
+                self.alarm_time_remaining_label.setText("")
+                return
+            if next_alarm.date() == self._alarm_last_fired_date:
+                self.alarm_time_remaining_label.setText("")
+                return
+            if now.date() == next_alarm.date() and now >= next_alarm:
+                if self._alarm_last_fired_date != now.date():
+                    self.trigger_alarm()
+                    self._alarm_last_fired_date = now.date()
 
     def update_alarm_remaining(self):
         if not self.alarm_enable_checkbox.isChecked():
             self.alarm_time_remaining_label.setText("")
             return
 
-        target_time = self.alarm_time_edit.time()
-        zone_name = self.alarm_zone_selector.currentText()
-        is_local = (zone_name == "Local")
-        offset = 0 if is_local else GLOBAL_ZONES.get(zone_name, 0)
-
-        now_utc = datetime.datetime.utcnow()
-        now_local = now_utc + datetime.timedelta(hours=offset) if not is_local else datetime.datetime.now()
-
-        active_days = [cb.isChecked() for cb in self.alarm_repeat_checkboxes]
-        target_hour = target_time.hour()
-        target_minute = target_time.minute()
-        today = now_local.date()
-        today_wd = now_local.weekday()
-
-        next_dt = None
-        days_ahead_for_label = None
-
-        if not any(active_days):
-            candidate_dt = datetime.datetime.combine(
-                today, datetime.time(target_hour, target_minute)
-            )
-            if candidate_dt <= now_local:
-                self.alarm_time_remaining_label.setText("No upcoming alarm without repeat days.")
-                return
-            next_dt = candidate_dt
-            days_ahead_for_label = 0
+        zone = self.alarm_zone_selector.currentText()
+        if zone == "Local":
+            now = datetime.datetime.now()
         else:
-            for d in range(7):
-                wd = (today_wd + d) % 7
-                if not active_days[wd]:
-                    continue
-                candidate_date = today + datetime.timedelta(days=d)
-                candidate_dt = datetime.datetime.combine(
-                    candidate_date,
-                    datetime.time(target_hour, target_minute)
-                )
-                if d == 0 and candidate_dt <= now_local:
-                    continue
-                next_dt = candidate_dt
-                days_ahead_for_label = d
-                break
+            utc = datetime.datetime.utcnow()
+            base_offset = GLOBAL_ZONES.get(zone, 0)
+            now = _apply_simple_dst(utc, zone, base_offset)
 
-            if next_dt is None:
-                self.alarm_time_remaining_label.setText("No upcoming alarm for selected days.")
-                return
+        alarm_time = self.alarm_time_edit.time()
+        alarm_dt = now.replace(hour=alarm_time.hour(), minute=alarm_time.minute(), second=0, microsecond=0)
 
-        diff = next_dt - now_local
-        total_seconds = int(diff.total_seconds())
-        if total_seconds < 0:
-            self.alarm_time_remaining_label.setText("No upcoming alarm for selected days.")
+        checked_days = [i for i, cb in enumerate(self.alarm_repeat_checkboxes) if cb.isChecked()]
+        if not checked_days:
+            if alarm_dt <= now:
+                alarm_dt += datetime.timedelta(days=1)
+            next_dt = alarm_dt
+        else:
+            today_weekday = now.weekday()
+            candidates = []
+            for d in checked_days:
+                days_ahead = (d - today_weekday) % 7
+                candidate = alarm_dt + datetime.timedelta(days=days_ahead)
+                if days_ahead == 0 and candidate <= now:
+                    candidate += datetime.timedelta(days=7)
+                candidates.append(candidate)
+            candidates.sort()
+            next_dt = candidates[0] if candidates else alarm_dt
+
+        diff = next_dt - now
+        if diff.total_seconds() < 0:
+            self.alarm_time_remaining_label.setText("")
             return
 
+        total_seconds = int(diff.total_seconds())
+        days_ahead_for_label = (next_dt.date() - now.date()).days
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
         seconds = total_seconds % 60
@@ -1259,9 +1514,10 @@ class ProjectTimeTrackerPanel:
 
     def update_global_clock(self):
         zone = self.global_zone_selector.currentText()
-        offset = GLOBAL_ZONES.get(zone, 0)
+        base_offset = GLOBAL_ZONES.get(zone, 0)
         utc = datetime.datetime.utcnow()
-        local = utc + datetime.timedelta(hours=offset)
+        # Apply simple DST for a few supported regions so Sydney, etc. match local.
+        local = _apply_simple_dst(utc, zone, base_offset)
         self.global_time_label.setText(local.strftime("%I:%M:%S %p"))
         self.global_date_label.setText(local.strftime("%a %b %d"))
 
@@ -1373,7 +1629,22 @@ if __name__ == '__main__':
     panel = ProjectTimeTrackerPanel()
     dock = QtGui.QDockWidget("CLOCK", mw)
     dock.setObjectName(dock_name)
+    
+    # FIXED: Proper dock features to match Report View behavior
+    dock.setFeatures(QtGui.QDockWidget.DockWidgetMovable | 
+                     QtGui.QDockWidget.DockWidgetFloatable |
+                     QtGui.QDockWidget.DockWidgetClosable)
+    
     dock.setWidget(panel.get_form())
+    
+    # FIXED: Add to right dock area like Report View
     mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+    
+    # Try to tabify with Report View if it exists
+    report_view = mw.findChild(QtGui.QDockWidget, "Report view")
+    if report_view:
+        mw.tabifyDockWidget(report_view, dock)
+        dock.raise_()  # Bring Clock to front
+    
     dock.show()
-    print("Clock & Time Tracker v1.9.9 loaded")
+    print("Clock & Time Tracker v2.0.4 Industry Quality loaded")
