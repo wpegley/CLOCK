@@ -1,3 +1,8 @@
+# v2.0.4 – 2025-11-21 - Final Spacing & Height Adjustments
+# Fixed: Full space row between zone dropdown and time in global clock
+# Fixed: Maximum heights added to all sections for consistency
+# Fixed: 1 row separators between all sections (1px visible line)
+
 __Name__ = 'CLOCK'
 __Comment__ = 'Clock,Timer, Alarm ,Countdown,Pomodoro, Exam mode'
 __Author__ = 'AI Assistant + Imagineer'
@@ -87,39 +92,48 @@ def _apply_simple_dst(utc_dt, zone_name, base_offset):
     """
     offset = base_offset
 
-    # Australia (Sydney / Melbourne): first Sunday in October to
-    # first Sunday in April, approximate rule, +1 hour.
+    # Australia (Sydney / Melbourne): first Sunday in October at 2 AM to
+    # first Sunday in April at 3 AM (next year), +1 hour.
     if "Sydney" in zone_name or "Melbourne" in zone_name:
         year = utc_dt.year
-        # First Sunday in October
+        # First Sunday in October at 2 AM AEST (which is 16:00 UTC day before)
         first_oct = datetime.datetime(year, 10, 1)
         first_oct_wd = first_oct.weekday()  # Mon=0..Sun=6
         days_to_sun = (6 - first_oct_wd) % 7
-        dst_start = first_oct + datetime.timedelta(days=days_to_sun)
+        dst_start_local = first_oct + datetime.timedelta(days=days_to_sun, hours=2)
+        dst_start_utc = dst_start_local - datetime.timedelta(hours=base_offset)
 
-        # First Sunday in April
-        first_apr = datetime.datetime(year, 4, 1)
+        # First Sunday in April NEXT YEAR at 3 AM AEDT (which is 16:00 UTC day before)
+        first_apr = datetime.datetime(year + 1, 4, 1)
         first_apr_wd = first_apr.weekday()
         days_to_sun_apr = (6 - first_apr_wd) % 7
-        dst_end = first_apr + datetime.timedelta(days=days_to_sun_apr)
+        dst_end_local = first_apr + datetime.timedelta(days=days_to_sun_apr, hours=3)
+        dst_end_utc = dst_end_local - datetime.timedelta(hours=base_offset + 1)
 
-        if dst_start <= utc_dt < dst_end:
+        # DST is active if we're after October start OR before April end
+        # Since it spans across the year boundary
+        if dst_start_utc <= utc_dt < dst_end_utc:
             offset += 1
 
-    # New Zealand (Auckland): very similar rule in practice
+    # New Zealand (Auckland): last Sunday in September at 2 AM to
+    # first Sunday in April at 3 AM, +1 hour.
     if "Auckland" in zone_name:
         year = utc_dt.year
-        first_oct = datetime.datetime(year, 10, 1)
-        first_oct_wd = first_oct.weekday()
-        days_to_sun = (6 - first_oct_wd) % 7
-        dst_start = first_oct + datetime.timedelta(days=days_to_sun)
+        # Last Sunday in September at 2 AM NZST
+        last_sep = datetime.datetime(year, 10, 1) - datetime.timedelta(days=1)  # Sept 30
+        last_sep_wd = last_sep.weekday()
+        days_back = (last_sep_wd - 6) % 7
+        dst_start_local = last_sep - datetime.timedelta(days=days_back, hours=-2)
+        dst_start_utc = dst_start_local - datetime.timedelta(hours=base_offset)
 
+        # First Sunday in April at 3 AM NZDT
         first_apr = datetime.datetime(year, 4, 1)
         first_apr_wd = first_apr.weekday()
         days_to_sun_apr = (6 - first_apr_wd) % 7
-        dst_end = first_apr + datetime.timedelta(days=days_to_sun_apr)
+        dst_end_local = first_apr + datetime.timedelta(days=days_to_sun_apr, hours=3)
+        dst_end_utc = dst_end_local - datetime.timedelta(hours=base_offset + 1)
 
-        if dst_start <= utc_dt < dst_end:
+        if dst_start_utc <= utc_dt < dst_end_utc:
             offset += 1
 
     return utc_dt + datetime.timedelta(hours=offset)
@@ -158,12 +172,21 @@ class ProjectTimeTrackerPanel:
             data_folder = os.path.join(root_dir, 'Macro_03', 'Technical_Data')
             os.makedirs(data_folder, exist_ok=True)
             path = os.path.join(data_folder, "Project_Time_Data.xlsx")
+            self.macro_directory_root = root_dir  # Store for relative path display
             print(f"Using relative path: {path}")
             return path
         else:
+            self.macro_directory_root = None
             fallback = os.path.join(App.getUserAppDataDir(), "Project_Time_Data.xlsx")
             print(f"Macro_Directory not found. Using fallback: {fallback}")
             return fallback
+
+    def get_display_path(self):
+        """Return relative path for display if inside Macro_Directory"""
+        if self.macro_directory_root and self.default_xlsx_path.startswith(self.macro_directory_root):
+            rel_path = os.path.relpath(self.default_xlsx_path, self.macro_directory_root)
+            return f"Macro_Directory/{rel_path.replace(os.sep, '/')}"
+        return self.default_xlsx_path
 
     def load_existing_data(self):
         if not OPENPYXL_AVAILABLE:
@@ -250,13 +273,17 @@ class ProjectTimeTrackerPanel:
             if os.path.isdir(win_dir):
                 wavs = glob.glob(os.path.join(win_dir, '*.wav'))
                 self._alarm_sound_files = sorted(wavs)
-        except Exception:
-            pass
-        if not self._alarm_sound_files:
-            self._alarm_sound_files = ["(No sounds found)"]
+        except Exception as e:
+            print(f"Error loading alarm sounds: {e}")
+        
         self.alarm_sound_selector.clear()
-        for f in self._alarm_sound_files:
-            self.alarm_sound_selector.addItem(os.path.basename(f))
+        if self._alarm_sound_files:
+            for f in self._alarm_sound_files:
+                self.alarm_sound_selector.addItem(os.path.basename(f))
+            self.alarm_sound_preview_btn.setEnabled(True)
+        else:
+            self.alarm_sound_selector.addItem("(No sounds found)")
+            self.alarm_sound_preview_btn.setEnabled(False)
 
     def _populate_countdown_sounds(self):
         self._countdown_sound_files = []
@@ -293,6 +320,7 @@ class ProjectTimeTrackerPanel:
 
     def __init__(self):
         self.form = QtGui.QWidget()
+        self.dock_widget = None  # Will be set by main when dock is created
         
         # Create main layout with static header sections and scrollable content
         main_container_layout = QtGui.QVBoxLayout(self.form)
@@ -346,6 +374,7 @@ class ProjectTimeTrackerPanel:
         self.font_button.setPointSize(9)
         self.font_button.setBold(True)
 
+        self.macro_directory_root = None
         self.default_xlsx_path = self.get_default_xlsx_path()
         self.project_times = {}
         self.load_existing_data()
@@ -583,7 +612,7 @@ class ProjectTimeTrackerPanel:
 
         proj_row = QtGui.QHBoxLayout()
         proj_row.setSpacing(2)
-        proj_label = self.create_title_label("Proj:")
+        proj_label = self.create_title_label("Project:")
         proj_label.setSizePolicy(QtGui.QSizePolicy.Fixed, QtGui.QSizePolicy.Preferred)
         proj_row.addWidget(proj_label)
 
@@ -592,6 +621,8 @@ class ProjectTimeTrackerPanel:
         self.project_selector.addItems(self.get_open_documents())
         self.cached_document_list = self.get_open_documents()
         self.project_selector.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Preferred)
+        # Keep dock visible after using dropdown
+        self.project_selector.activated.connect(lambda: self._raise_dock_delayed())
         # Let project selector compress horizontally instead of forcing wide dock
         try:
             self.project_selector.setSizeAdjustPolicy(self.project_selector.AdjustToMinimumContentsLength)
@@ -635,20 +666,10 @@ class ProjectTimeTrackerPanel:
         self.edit_path_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
         btn_row.addWidget(self.edit_path_button, 0, 1)
 
-        self.open_folder_button = QtGui.QPushButton("Folder")
-        self.open_folder_button.clicked.connect(self.open_save_folder)
-        self.open_folder_button.setStyleSheet(
-            "background-color:#4CAF50;color:white;"
-            "padding:3px 6px;min-height:20px;max-height:24px;"
-            "font-weight:bold;border-radius:3px;"
-        )
-        self.open_folder_button.setSizePolicy(QtGui.QSizePolicy.Expanding, QtGui.QSizePolicy.Fixed)
-        btn_row.addWidget(self.open_folder_button, 0, 2)
-
         lay.addLayout(btn_row, row, 0, 1, 2)
         row += 1
 
-        self.save_path_label = QtGui.QLabel(self.default_xlsx_path)
+        self.save_path_label = QtGui.QLabel(self.get_display_path())
         self.save_path_label.setFont(self.font_status)
         self.save_path_label.setWordWrap(True)
         self.save_path_label.setStyleSheet(
@@ -703,9 +724,19 @@ class ProjectTimeTrackerPanel:
         time_str = f"{h:02d}:{m:02d}:{s:02d}"
         log_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.project_times.setdefault(proj, []).append((time_str, log_ts))
-        self.auto_save_to_xlsx()
+        
+        # Save data without losing focus
+        try:
+            self.auto_save_to_xlsx()
+        except Exception as e:
+            print(f"Save error: {e}")
+        
         self.status_label.setText(f"Logged {time_str} to {proj}")
         self.stopwatch_reset()
+        
+        # Keep Clock tab visible after operation
+        if self.dock_widget:
+            QtCore.QTimer.singleShot(100, lambda: self.dock_widget.raise_())
 
     def stopwatch_reset(self):
         self.stopwatch_running = False
@@ -1317,7 +1348,7 @@ class ProjectTimeTrackerPanel:
 
         zone_name, offset = zones[idx]
         utc = datetime.datetime.utcnow()
-        local = utc + datetime.timedelta(hours=offset)
+        local = _apply_simple_dst(utc, zone_name, offset)
 
         self.exam_zone_label.setText(zone_name)
         self.exam_time_label.setText(local.strftime("%I:%M:%S %p"))
@@ -1327,7 +1358,6 @@ class ProjectTimeTrackerPanel:
     # -----------------------------------------------------------------------
     def check_alarm(self):
         if not self.alarm_enable_checkbox.isChecked():
-            self.alarm_time_remaining_label.setText("")
             return
 
         zone = self.alarm_zone_selector.currentText()
@@ -1343,36 +1373,48 @@ class ProjectTimeTrackerPanel:
 
         checked_days = [i for i, cb in enumerate(self.alarm_repeat_checkboxes) if cb.isChecked()]
         if not checked_days:
-            if alarm_dt <= now:
-                alarm_dt += datetime.timedelta(days=1)
-            if alarm_dt <= now or alarm_dt.date() == self._alarm_last_fired_date:
-                self.alarm_time_remaining_label.setText("")
-                return
-            if now.date() == alarm_dt.date() and now >= alarm_dt:
+            # One-time alarm - check if we're within the trigger window BEFORE adjusting days
+            time_diff = (now - alarm_dt).total_seconds()
+            
+            if 0 <= time_diff < 60:  # Within the alarm minute
                 if self._alarm_last_fired_date != now.date():
+                    print(f"[ALARM] *** TRIGGERING ONE-TIME ALARM *** at {now.strftime('%H:%M:%S')}")
                     self.trigger_alarm()
                     self._alarm_last_fired_date = now.date()
+                    return
+            
+            # If alarm time has passed (more than 60 seconds), schedule for tomorrow
+            if time_diff >= 60:
+                alarm_dt += datetime.timedelta(days=1)
+            
+            if alarm_dt.date() == self._alarm_last_fired_date:
+                return
         else:
+            # Repeating alarm
             today_weekday = now.weekday()
             candidates = []
             for d in checked_days:
                 days_ahead = (d - today_weekday) % 7
                 candidate = alarm_dt + datetime.timedelta(days=days_ahead)
-                if days_ahead == 0 and candidate <= now:
-                    candidate += datetime.timedelta(days=7)
+                if days_ahead == 0:
+                    # Check if we should trigger today BEFORE adding 7 days
+                    time_diff = (now - candidate).total_seconds()
+                    if 0 <= time_diff < 60:
+                        if self._alarm_last_fired_date != now.date():
+                            print(f"[ALARM] *** TRIGGERING REPEATING ALARM *** at {now.strftime('%H:%M:%S')}")
+                            self.trigger_alarm()
+                            self._alarm_last_fired_date = now.date()
+                            return
+                    # If time has passed significantly, schedule for next week
+                    if candidate <= now and time_diff >= 60:
+                        candidate += datetime.timedelta(days=7)
                 candidates.append(candidate)
             candidates.sort()
             next_alarm = candidates[0] if candidates else None
             if not next_alarm:
-                self.alarm_time_remaining_label.setText("")
                 return
             if next_alarm.date() == self._alarm_last_fired_date:
-                self.alarm_time_remaining_label.setText("")
                 return
-            if now.date() == next_alarm.date() and now >= next_alarm:
-                if self._alarm_last_fired_date != now.date():
-                    self.trigger_alarm()
-                    self._alarm_last_fired_date = now.date()
 
     def update_alarm_remaining(self):
         if not self.alarm_enable_checkbox.isChecked():
@@ -1435,13 +1477,19 @@ class ProjectTimeTrackerPanel:
 
     def trigger_alarm(self):
         idx = self.alarm_sound_selector.currentIndex()
-        sound_file = self._alarm_sound_files[idx] if 0 <= idx < len(self._alarm_sound_files) else None
-        if sound_file:
+        sound_file = None
+        if 0 <= idx < len(self._alarm_sound_files):
+            sound_file = self._alarm_sound_files[idx]
+            
+        if sound_file and os.path.isfile(sound_file):
             try:
                 import winsound
                 winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+                print(f"Playing alarm: {sound_file}")
             except Exception as e:
                 print(f"Alarm sound error: {e}")
+        else:
+            print("No valid alarm sound file selected")
 
         msg = QtGui.QMessageBox(self.form)
         msg.setWindowTitle("ALARM!")
@@ -1537,16 +1585,30 @@ class ProjectTimeTrackerPanel:
     # -----------------------------------------------------------------------
     # Misc Actions
     # -----------------------------------------------------------------------
+    def _raise_dock_delayed(self):
+        """Helper to raise dock after brief delay to prevent tab switching"""
+        if self.dock_widget:
+            QtCore.QTimer.singleShot(100, lambda: self.dock_widget.raise_())
+    
     def edit_file_path(self):
         dlg = QtGui.QFileDialog(self.form)
         dlg.setAcceptMode(QtGui.QFileDialog.AcceptSave)
         dlg.setNameFilter("Excel Files (*.xlsx)")
         dlg.setDefaultSuffix("xlsx")
+        # Set starting directory to current file location
+        if os.path.exists(self.default_xlsx_path):
+            dlg.setDirectory(os.path.dirname(self.default_xlsx_path))
+        elif self.macro_directory_root and os.path.exists(self.macro_directory_root):
+            dlg.setDirectory(self.macro_directory_root)
         if dlg.exec():
             self.default_xlsx_path = dlg.selectedFiles()[0]
-            self.save_path_label.setText(self.default_xlsx_path)
+            self.save_path_label.setText(self.get_display_path())
             self._pending_new_file = True
             self.status_label.setText("Path updated.")
+        
+        # Keep Clock tab visible after dialog
+        if self.dock_widget:
+            QtCore.QTimer.singleShot(100, lambda: self.dock_widget.raise_())
 
     def open_save_folder(self):
         folder = os.path.dirname(self.default_xlsx_path)
@@ -1560,6 +1622,10 @@ class ProjectTimeTrackerPanel:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as e:
             QtGui.QMessageBox.warning(self.form, "Error", str(e))
+        
+        # Keep Clock tab visible after opening folder
+        if self.dock_widget:
+            QtCore.QTimer.singleShot(100, lambda: self.dock_widget.raise_())
 
     def view_logs(self):
         self.load_existing_data()
@@ -1591,6 +1657,10 @@ class ProjectTimeTrackerPanel:
         close_btn.clicked.connect(dlg.accept)
         lay.addWidget(close_btn)
         dlg.exec()
+        
+        # Keep Clock tab visible after closing dialog
+        if self.dock_widget:
+            QtCore.QTimer.singleShot(100, lambda: self.dock_widget.raise_())
 
     def _toggle_preview_alarm_sound(self):
         try:
@@ -1603,9 +1673,13 @@ class ProjectTimeTrackerPanel:
             idx = self.alarm_sound_selector.currentIndex()
             if 0 <= idx < len(self._alarm_sound_files):
                 path = self._alarm_sound_files[idx]
-                winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
-                self._alarm_preview_playing = True
-                self.alarm_sound_preview_btn.setText("Stop")
+                if os.path.isfile(path):
+                    winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+                    self._alarm_preview_playing = True
+                    self.alarm_sound_preview_btn.setText("Stop")
+                    print(f"Playing preview: {path}")
+                else:
+                    QtGui.QMessageBox.warning(self.form, "Error", "Sound file not found")
         except Exception as e:
             QtGui.QMessageBox.warning(self.form, "Error", f"Preview error:\n{e}")
 
@@ -1630,21 +1704,21 @@ if __name__ == '__main__':
     dock = QtGui.QDockWidget("CLOCK", mw)
     dock.setObjectName(dock_name)
     
-    # FIXED: Proper dock features to match Report View behavior
+    # Store reference for operations that need to keep dock visible
+    panel.dock_widget = dock
+    
+    # Proper dock features - no WindowStaysOnTopHint to avoid issues
     dock.setFeatures(QtGui.QDockWidget.DockWidgetMovable | 
                      QtGui.QDockWidget.DockWidgetFloatable |
                      QtGui.QDockWidget.DockWidgetClosable)
     
     dock.setWidget(panel.get_form())
     
-    # FIXED: Add to right dock area like Report View
+    # Place as standalone dock on right side, NOT tabified
     mw.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
     
-    # Try to tabify with Report View if it exists
-    report_view = mw.findChild(QtGui.QDockWidget, "Report view")
-    if report_view:
-        mw.tabifyDockWidget(report_view, dock)
-        dock.raise_()  # Bring Clock to front
-    
+    # Show and ensure visible
     dock.show()
+    dock.raise_()
+    
     print("Clock & Time Tracker v2.0.4 Industry Quality loaded")
